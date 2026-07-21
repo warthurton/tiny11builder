@@ -1,3 +1,4 @@
 tiny11/**
-tiny11_*.log
+logs/
+output/
 *.iso
