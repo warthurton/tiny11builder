@@ -3,7 +3,7 @@
     Main runner script to build a trimmed-down Windows 11 image.
 
 .DESCRIPTION
-    This runner imports reusable functions from asl-win11maker.functions.ps1 and
+    This runner imports reusable functions from asl-win11.functions.ps1 and
     executes the build workflow in a clear, commentable function list.
 
 .PARAMETER ISO
@@ -31,7 +31,7 @@ if (-not $SCRATCH) {
 
 $script:EntryScriptPath = $PSCommandPath
 
-$functionsScriptPath = Join-Path $PSScriptRoot 'asl-win11maker.functions.ps1'
+$functionsScriptPath = Join-Path $PSScriptRoot 'asl-win11.functions.ps1'
 if (-not (Test-Path -Path $functionsScriptPath)) {
     Write-Error "Required function library not found: $functionsScriptPath"
     Read-Host 'Press Enter to exit' | Out-Null
