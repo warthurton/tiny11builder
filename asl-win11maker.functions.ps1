@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Reusable functions for tiny11 image creation workflows.
+    Reusable functions for asl-win11 image creation workflows.
 
 .DESCRIPTION
-    This file contains reusable functions used by tiny11 main scripts.
-    It is intended to be dot-sourced by runner scripts such as tiny11maker.ps1.
+    This file contains reusable functions used by asl-win11 main scripts.
+    It is intended to be dot-sourced by runner scripts such as asl-win11maker.ps1.
 #>
 function Wait-ForAcknowledgement {
     param (
@@ -506,15 +506,15 @@ function Confirm-AutounattendXml {
 function Initialize-Tiny11Session {
     $logsDir = Join-Path $PSScriptRoot 'logs'
     New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
-    Start-Transcript -Path "$logsDir\tiny11_$(Get-Date -f yyyyMMdd_HHmms).log"
+    Start-Transcript -Path "$logsDir\asl-win11_$(Get-Date -f yyyyMMdd_HHmms).log"
 
-    $Host.UI.RawUI.WindowTitle = "Tiny11 image creator"
+    $Host.UI.RawUI.WindowTitle = "ASL-Win11 image creator"
     Clear-Host
-    Write-Phase 'Initialize tiny11 build session'
-    Write-Output 'Welcome to the tiny11 image creator! Release: 09-07-25'
+    Write-Phase 'Initialize asl-win11 build session'
+    Write-Output 'Welcome to the asl-win11 image creator! Release: 09-07-25'
 
     $script:hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
-    $script:tiny11Root = "$script:BuildScratchRoot\tiny11"
+    $script:tiny11Root = "$script:BuildScratchRoot\asl-win11"
     $script:mountDir = "$script:BuildScratchRoot\scratchdir"
     $script:installWimPath = "$script:tiny11Root\sources\install.wim"
     $script:bootWimPath = "$script:tiny11Root\sources\boot.wim"
@@ -688,7 +688,7 @@ function New-Tiny11Iso {
     Write-Output '  Creating ISO image...'
     $outputDir = Join-Path $PSScriptRoot 'output'
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    $isoPath = "$outputDir\tiny11_$(Get-Date -f yyyyMMdd).iso"
+    $isoPath = "$outputDir\asl-win11_$(Get-Date -f yyyyMMdd).iso"
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$script:hostArchitecture\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
