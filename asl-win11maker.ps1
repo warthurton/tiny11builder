@@ -24,7 +24,7 @@ param (
 )
 
 if (-not $SCRATCH) {
-    $script:BuildScratchRoot = $PSScriptRoot -replace '[\\]+$', ''
+    $script:BuildScratchRoot = Join-Path $PSScriptRoot 'work'
 } else {
     $script:BuildScratchRoot = $SCRATCH + ":"
 }

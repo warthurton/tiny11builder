@@ -17,7 +17,7 @@ $myWindowsPrincipal=new-object System.Security.Principal.WindowsPrincipal($myWin
 $adminRole=[System.Security.Principal.WindowsBuiltInRole]::Administrator
 if (! $myWindowsPrincipal.IsInRole($adminRole))
 {
-    Write-Host "Restarting Tiny11 image creator as admin in a new window, you can close this one."
+    Write-Host "Restarting asl-win11 image creator as admin in a new window, you can close this one."
     $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell";
     $newProcess.Arguments = $myInvocation.MyCommand.Definition;
     $newProcess.Verb = "runas";
@@ -38,7 +38,9 @@ if ($input -eq 'y') {
 Start-Sleep -Seconds 3
 Clear-Host
 
-$mainOSDrive = $env:SystemDrive
+$workDir = Join-Path $PSScriptRoot 'work'
+New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+$mainOSDrive = $workDir
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 New-Item -ItemType Directory -Force -Path "$mainOSDrive\asl-win11\sources" >null
 $DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"
