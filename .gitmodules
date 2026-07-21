@@ -1,9 +1,12 @@
 [submodule "winutil"]
-	path = winutil
+	path = reference/winutil
 	url = https://github.com/ChrisTitusTech/winutil.git
 [submodule "tiny11-automated"]
-	path = tiny11-automated
+	path = reference/tiny11-automated
 	url = https://github.com/kelexine/tiny11-automated.git
 [submodule "tiny11builder-ntdevlabs"]
-	path = tiny11builder-ntdevlabs
+	path = reference/tiny11builder-ntdevlabs
 	url = https://github.com/ntdevlabs/tiny11builder.git
+[submodule "rufus"]
+	path = reference/rufus
+	url = https://github.com/pbatard/rufus.git
