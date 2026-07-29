@@ -1514,10 +1514,20 @@ function Confirm-InstallWimSource {
 }
 
 function Copy-SourceImageFiles {
+    <#
+    .DESCRIPTION
+        install.esd is optional — only present when the source media ships an ESD
+        instead of a WIM (see Confirm-InstallWimSource) — so its cleanup below must use
+        -ErrorAction SilentlyContinue rather than the old `> $null 2>&1` redirection
+        trick. Output redirection only affects where a written error record goes; it
+        does not stop $ErrorActionPreference = 'Stop' (set globally in
+        asl-win11maker.ps1) from turning a missing-file error into a terminating
+        exception before it ever reaches the redirect.
+    #>
     Write-Phase 'Copy source image files'
     Copy-Item -Path "$script:DriveLetter\*" -Destination $script:tiny11Root -Recurse -Force | Out-Null
-    Set-ItemProperty -Path "$script:tiny11Root\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1
-    Remove-Item "$script:tiny11Root\sources\install.esd" > $null 2>&1
+    Set-ItemProperty -Path "$script:tiny11Root\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    Remove-Item "$script:tiny11Root\sources\install.esd" -ErrorAction SilentlyContinue
     Write-Output '  Source image copy complete.'
 }
 
