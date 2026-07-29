@@ -40,6 +40,12 @@ if (-not (Test-Path -Path $functionsScriptPath)) {
 
 . $functionsScriptPath
 
+#---------[ Error Handling ]---------#
+# REQUIRED: fail fast instead of continuing past a broken step, so the top-level
+# try/catch below always gets a chance to run emergency cleanup.
+$ErrorActionPreference = 'Stop'
+
+try {
 #---------[ Main Workflow ]---------#
 # REQUIRED SETUP STEPS (do not comment out)
 Confirm-ExecutionPolicy        # REQUIRED: ensure script execution policy allows running
@@ -125,6 +131,7 @@ Remove-ProvisionedAppPackages -ImagePath $script:mountDir -PackagePrefixes $appP
 
 # OPTIONAL FILE CUSTOMIZATION STEPS (safe to comment out)
 Remove-OneDriveSetup -MountDir $script:mountDir -AdminGroupName $script:adminGroupName            # OPTIONAL: remove OneDrive setup executable
+Remove-IsoSupportFolder -ContentRoot $script:tiny11Root                                           # OPTIONAL: drop support\ folder to shrink final ISO
 
 # REQUIRED REGISTRY PHASE BOUNDARIES (do not comment out)
 Mount-OfflineRegistryHives                                                                        # REQUIRED: load offline hives before registry tweaks
@@ -152,7 +159,17 @@ Dismount-OfflineRegistryHives                                                   
 Complete-InstallImage      # REQUIRED: cleanup, unmount, and export updated install image
 Set-BootImageBypassTweaks  # REQUIRED: apply setup bypass tweaks in boot.wim index 2
 New-Tiny11Iso              # REQUIRED: build final ISO using oscdimg
+Write-BuildInfo -OutputPath (Join-Path $PSScriptRoot 'output\asl-win11-buildinfo.json')  # OPTIONAL: emit build metadata JSON
 Invoke-Tiny11Cleanup       # REQUIRED: remove temp files and eject mounted source media
 
 Stop-Transcript  # REQUIRED: stop transcript logging
 exit             # REQUIRED: end script
+} catch {
+    # REQUIRED: emergency cleanup so a mid-pipeline failure doesn't leave images mounted
+    # or registry hives loaded, which would block the next run.
+    Write-Output "FATAL ERROR: $_"
+    Write-Output "Stack trace: $($_.ScriptStackTrace)"
+    Invoke-Tiny11EmergencyCleanup
+    try { Stop-Transcript } catch {}
+    exit 1
+}

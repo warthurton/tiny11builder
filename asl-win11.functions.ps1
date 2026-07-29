@@ -20,7 +20,30 @@ function Write-Phase {
     )
 
     Write-Output ''
-    Write-Output "=== $Title ==="
+    Write-Log "=== $Title ==="
+}
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a timestamped, leveled log line to the console and the structured log file.
+    .DESCRIPTION
+        Additive to Start-Transcript: the transcript captures raw console output, while this
+        writes a parallel `$script:structuredLogPath` file with timestamp/level prefixes for
+        easier post-run triage. Silently skips the file write if no session has been
+        initialized yet (e.g. a failure before Initialize-Tiny11Session ran).
+    #>
+    param (
+        [string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$timestamp] [$Level] $Message"
+    Write-Output $line
+    if ($script:structuredLogPath) {
+        Add-Content -Path $script:structuredLogPath -Value $line -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-RegistryDisplayName {
@@ -216,6 +239,186 @@ function Remove-ScheduledTasks {
     } else {
         Write-Output "Removed $removedCount scheduled task definition(s)."
     }
+}
+
+function Remove-IsoSupportFolder {
+    <#
+    .SYNOPSIS
+        Removes the support\ folder from the ISO contents directory.
+    .DESCRIPTION
+        The support\ folder only contains OEM/support tooling that isn't needed to install
+        Windows; dropping it is a small, safe reduction in final ISO size.
+    #>
+    param (
+        [string]$ContentRoot
+    )
+    Write-Phase 'Remove ISO support folder'
+    $supportPath = Join-Path $ContentRoot 'support'
+    if (Test-Path $supportPath) {
+        Remove-Item -Path $supportPath -Recurse -Force
+        Write-Output '  Removed support\ folder.'
+    } else {
+        Write-Output '  support\ folder not present; nothing to remove.'
+    }
+}
+
+#---------[ Answer File & Edition Enforcement Functions ]---------#
+
+function Get-AnswerFileChildElement {
+    <#
+    .SYNOPSIS
+        Finds (or creates) a namespace-qualified child element under an XML parent.
+    #>
+    param (
+        [Parameter(Mandatory)][System.Xml.XmlElement]$Parent,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$NamespaceUri
+    )
+
+    foreach ($childNode in $Parent.ChildNodes) {
+        if ($childNode.NodeType -eq [System.Xml.XmlNodeType]::Element -and
+            $childNode.LocalName -eq $Name -and
+            $childNode.NamespaceURI -eq $NamespaceUri) {
+            return [System.Xml.XmlElement]$childNode
+        }
+    }
+
+    $childElement = $Parent.OwnerDocument.CreateElement($Name, $NamespaceUri)
+    [void]$Parent.AppendChild($childElement)
+    return $childElement
+}
+
+function ConvertTo-Tiny11AnswerFile {
+    <#
+    .SYNOPSIS
+        Injects the selected install image index into autounattend.xml.
+    .DESCRIPTION
+        Namespace-aware edit of the windowsPE/Microsoft-Windows-Setup/ImageInstall/OSImage/
+        InstallFrom node so Setup installs the edition actually chosen via
+        Select-InstallImageIndex, instead of relying on the answer file's own (possibly
+        stale) assumptions. Also strips empty/placeholder product keys so Setup doesn't
+        fail edition matching against them.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$XmlContent,
+        [int]$ImageIndex = 1
+    )
+
+    if ($ImageIndex -lt 1) { $ImageIndex = 1 }
+
+    $unattendNs = 'urn:schemas-microsoft-com:unattend'
+    $wcmNs = 'http://schemas.microsoft.com/WMIConfig/2002/State'
+
+    $xmlDoc = [xml]::new()
+    $xmlDoc.PreserveWhitespace = $true
+    $xmlDoc.LoadXml($XmlContent)
+
+    if ($xmlDoc.DocumentElement.NamespaceURI -ne $unattendNs) {
+        throw "Unexpected autounattend.xml namespace: $($xmlDoc.DocumentElement.NamespaceURI)"
+    }
+
+    if (-not $xmlDoc.DocumentElement.HasAttribute('xmlns:wcm')) {
+        $xmlDoc.DocumentElement.SetAttribute('wcm', 'http://www.w3.org/2000/xmlns/', $wcmNs)
+    }
+
+    $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+    $nsMgr.AddNamespace('u', $unattendNs)
+
+    $windowsPESettings = $xmlDoc.SelectSingleNode('/u:unattend/u:settings[@pass="windowsPE"]', $nsMgr)
+    if (-not $windowsPESettings) {
+        $windowsPESettings = $xmlDoc.CreateElement('settings', $unattendNs)
+        $windowsPESettings.SetAttribute('pass', 'windowsPE')
+        [void]$xmlDoc.DocumentElement.PrependChild($windowsPESettings)
+    }
+
+    $setupComponent = $windowsPESettings.SelectSingleNode('u:component[@name="Microsoft-Windows-Setup"]', $nsMgr)
+    if (-not $setupComponent) {
+        $setupComponent = $xmlDoc.CreateElement('component', $unattendNs)
+        $setupComponent.SetAttribute('name', 'Microsoft-Windows-Setup')
+        $setupComponent.SetAttribute('processorArchitecture', 'amd64')
+        $setupComponent.SetAttribute('publicKeyToken', '31bf3856ad364e35')
+        $setupComponent.SetAttribute('language', 'neutral')
+        $setupComponent.SetAttribute('versionScope', 'nonSxS')
+        [void]$windowsPESettings.AppendChild($setupComponent)
+    }
+
+    $productKeyNodes = @($setupComponent.SelectNodes('u:UserData/u:ProductKey', $nsMgr))
+    foreach ($productKeyNode in $productKeyNodes) {
+        $keyNode = $productKeyNode.SelectSingleNode('u:Key', $nsMgr)
+        $keyValue = if ($keyNode) { $keyNode.InnerText.Trim() } else { '' }
+
+        if ([string]::IsNullOrWhiteSpace($keyValue) -or $keyValue -eq '00000-00000-00000-00000-00000') {
+            [void]$productKeyNode.ParentNode.RemoveChild($productKeyNode)
+        }
+    }
+
+    $imageInstall = Get-AnswerFileChildElement -Parent $setupComponent -Name 'ImageInstall' -NamespaceUri $unattendNs
+    $osImage = Get-AnswerFileChildElement -Parent $imageInstall -Name 'OSImage' -NamespaceUri $unattendNs
+    $installFrom = Get-AnswerFileChildElement -Parent $osImage -Name 'InstallFrom' -NamespaceUri $unattendNs
+
+    $existingMetadataNodes = @($installFrom.SelectNodes('u:MetaData', $nsMgr))
+    foreach ($metadataNode in $existingMetadataNodes) {
+        [void]$installFrom.RemoveChild($metadataNode)
+    }
+
+    $metadata = $xmlDoc.CreateElement('MetaData', $unattendNs)
+    $actionAttribute = $xmlDoc.CreateAttribute('wcm', 'action', $wcmNs)
+    $actionAttribute.Value = 'add'
+    [void]$metadata.Attributes.Append($actionAttribute)
+
+    $keyElement = $xmlDoc.CreateElement('Key', $unattendNs)
+    $keyElement.InnerText = '/IMAGE/INDEX'
+    [void]$metadata.AppendChild($keyElement)
+
+    $valueElement = $xmlDoc.CreateElement('Value', $unattendNs)
+    $valueElement.InnerText = [string]$ImageIndex
+    [void]$metadata.AppendChild($valueElement)
+
+    [void]$installFrom.AppendChild($metadata)
+
+    return $xmlDoc.OuterXml
+}
+
+function Set-Tiny11EditionConfig {
+    <#
+    .SYNOPSIS
+        Pins the selected edition via sources\ei.cfg and removes sources\PID.txt.
+    .DESCRIPTION
+        Without this, Setup can fall back to a stale firmware-embedded product key that
+        doesn't match the edition actually selected via Select-InstallImageIndex, causing
+        an edition-mismatch failure at install time.
+    #>
+    param (
+        [string]$ContentRoot,
+        [string]$EditionId
+    )
+    Write-Phase 'Apply edition enforcement (ei.cfg / PID.txt)'
+    $sourcesDir = Join-Path $ContentRoot 'sources'
+    New-Item -ItemType Directory -Force -Path $sourcesDir | Out-Null
+
+    $pidPath = Join-Path $sourcesDir 'PID.txt'
+    if (Test-Path $pidPath) {
+        Remove-Item -Path $pidPath -Force
+        Write-Output '  Removed sources\PID.txt so setup will not force a stale product key.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($EditionId)) {
+        Write-Output '  Skipped sources\ei.cfg: selected edition ID is unknown.'
+        return
+    }
+
+    $eiCfgPath = Join-Path $sourcesDir 'ei.cfg'
+    $eiCfg = @"
+[EditionID]
+$EditionId
+[Channel]
+Retail
+[VL]
+0
+"@.Trim()
+
+    Set-Content -Path $eiCfgPath -Value $eiCfg -Encoding ASCII -Force
+    Write-Output "  Written sources\ei.cfg for EditionID '$EditionId'."
 }
 
 #---------[ Registry Tweak Functions ]---------#
@@ -497,6 +700,34 @@ function Confirm-AdminPrivileges {
     }
 }
 
+function Invoke-Tiny11EmergencyCleanup {
+    <#
+    .SYNOPSIS
+        Best-effort recovery from a mid-pipeline failure.
+    .DESCRIPTION
+        Discards any images left mounted (install.wim or boot.wim) and unloads offline
+        registry hives so a failed run doesn't block the next one. Called from the
+        top-level catch block in asl-win11maker.ps1 — every step here is best-effort and
+        swallows its own errors since we're already in a failure path.
+    #>
+    Write-Log 'Running emergency cleanup after failure...' 'WARN'
+
+    try {
+        Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Log "  Emergency dismount: $($_.Path)" 'WARN'
+            Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue | Out-Null
+        }
+    } catch {
+        Write-Log "  Emergency image dismount failed: $_" 'ERROR'
+    }
+
+    foreach ($hive in @('zCOMPONENTS', 'zDEFAULT', 'zNTUSER', 'zSOFTWARE', 'zSYSTEM')) {
+        & 'reg' 'unload' "HKLM\$hive" 2>$null | Out-Null
+    }
+
+    Write-Log 'Emergency cleanup complete.' 'WARN'
+}
+
 function Confirm-AutounattendXml {
     if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
         Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml"
@@ -506,7 +737,9 @@ function Confirm-AutounattendXml {
 function Initialize-Tiny11Session {
     $logsDir = Join-Path $PSScriptRoot 'logs'
     New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
-    Start-Transcript -Path "$logsDir\asl-win11_$(Get-Date -f yyyyMMdd_HHmms).log"
+    $timestamp = Get-Date -f yyyyMMdd_HHmms
+    Start-Transcript -Path "$logsDir\asl-win11_$timestamp.log"
+    $script:structuredLogPath = "$logsDir\asl-win11_$timestamp.structured.log"
 
     $Host.UI.RawUI.WindowTitle = "ASL-Win11 image creator"
     Clear-Host
@@ -617,6 +850,43 @@ function Show-ImageMetadata {
     if (-not $script:architecture) {
         Write-Output "Architecture information not found."
     }
+
+    # Build/edition metadata for Write-BuildInfo and the ei.cfg edition-enforcement step.
+    $script:detectedImageName = Get-DismInfoField -Lines $lines -FieldName 'Name'
+    $script:editionId = Get-DismInfoField -Lines $lines -FieldName 'Edition ID'
+    $versionField = Get-DismInfoField -Lines $lines -FieldName 'Version'
+    $serviceBuildField = Get-DismInfoField -Lines $lines -FieldName 'ServicePack Build'
+    $script:detectedFullVersion = if ($serviceBuildField) { "$versionField.$serviceBuildField" } else { $versionField }
+
+    if ($script:detectedFullVersion -match '(\d+\.\d+)$') {
+        $script:detectedBuildNumber = $Matches[1]
+    } else {
+        $script:detectedBuildNumber = ''
+    }
+
+    if ($script:editionId) {
+        Write-Output "Edition ID: $script:editionId"
+    } else {
+        Write-Output "Edition ID not found; ei.cfg will be skipped."
+    }
+}
+
+function Get-DismInfoField {
+    <#
+    .SYNOPSIS
+        Extracts a "Field Name : value" line from DISM text output.
+    #>
+    param (
+        [string[]]$Lines,
+        [string]$FieldName
+    )
+
+    foreach ($line in $Lines) {
+        if ($line -match "^\s*$([regex]::Escape($FieldName))\s*:\s*(.+?)\s*$") {
+            return $Matches[1]
+        }
+    }
+    return ''
 }
 
 function Mount-OfflineRegistryHives {
@@ -683,12 +953,22 @@ function Set-BootImageBypassTweaks {
 
 function New-Tiny11Iso {
     Write-Phase 'Build ISO image'
-    Write-Output '  Copying unattended file for OOBE local account bypass...'
-    Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$script:tiny11Root\autounattend.xml" -Force | Out-Null
+    Write-Output '  Preparing unattended file for OOBE local account bypass...'
+    $preparedAutounattendXml = Get-Content -Path "$PSScriptRoot\autounattend.xml" -Raw
+    try {
+        $preparedAutounattendXml = ConvertTo-Tiny11AnswerFile -XmlContent $preparedAutounattendXml -ImageIndex $script:index
+        Write-Output "  Injected image index $script:index into autounattend.xml."
+    } catch {
+        Write-Log "Could not inject image index into autounattend.xml: $_" 'WARN'
+    }
+    Set-Content -Path "$script:tiny11Root\autounattend.xml" -Value $preparedAutounattendXml -Encoding UTF8 -Force
+
+    Set-Tiny11EditionConfig -ContentRoot $script:tiny11Root -EditionId $script:editionId
+
     Write-Output '  Creating ISO image...'
     $outputDir = Join-Path $PSScriptRoot 'output'
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    $isoPath = "$outputDir\asl-win11_$(Get-Date -f yyyyMMdd).iso"
+    $script:isoPath = "$outputDir\asl-win11_$(Get-Date -f yyyyMMdd).iso"
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$script:hostArchitecture\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
@@ -717,7 +997,37 @@ function New-Tiny11Iso {
         $OSCDIMG = $localOSCDIMGPath
     }
 
-    & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$script:tiny11Root\boot\etfsboot.com#pEF,e,b$script:tiny11Root\efi\microsoft\boot\efisys.bin" "$script:tiny11Root" "$isoPath"
+    & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$script:tiny11Root\boot\etfsboot.com#pEF,e,b$script:tiny11Root\efi\microsoft\boot\efisys.bin" "$script:tiny11Root" "$script:isoPath"
+}
+
+function Write-BuildInfo {
+    <#
+    .SYNOPSIS
+        Emits a build metadata JSON file alongside the finished ISO.
+    .DESCRIPTION
+        Machine-readable companion to the ISO (Windows build number, full version, image
+        name, edition ID, selected index, and output path) for CI or other tooling to
+        consume without re-parsing DISM output.
+    #>
+    param (
+        [string]$OutputPath
+    )
+    Write-Phase 'Write build info'
+    try {
+        $buildInfo = [ordered]@{
+            windows_build = $script:detectedBuildNumber
+            full_version  = $script:detectedFullVersion
+            image_name    = $script:detectedImageName
+            edition_id    = $script:editionId
+            image_index   = $script:index
+            iso_path      = $script:isoPath
+            generated_at  = (Get-Date -Format 'o')
+        }
+        $buildInfo | ConvertTo-Json | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
+        Write-Output "  Build info written to $OutputPath"
+    } catch {
+        Write-Log "Failed to write build info to $OutputPath : $_" 'WARN'
+    }
 }
 
 function Invoke-Tiny11Cleanup {
