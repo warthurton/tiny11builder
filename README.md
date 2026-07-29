@@ -12,14 +12,23 @@ The script has also been updated to use DISM's recovery compression, resulting i
 Also included is an unattended answer file, which is used to bypass the Microsoft Account on OOBE and to deploy the image with the `/compact` flag.
 It's open-source, **so feel free to add or remove anything you want!** Feedback is also much appreciated.
 
-Also, for the very first time, **introducing tiny11 core builder**! A more powerful script, designed for a quick and dirty development testbed. Just the bare minimum, none of the fluff. 
-This script generates a significantly reduced Windows 11 image. However, **it's not suitable for regular use due to its lack of serviceability - you can't add languages, updates, or features post-creation**. tiny11 Core is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful for VM environments.
+Also included is a **core build mode** for a quick and dirty development testbed. Just the bare minimum, none
+of the fluff. It generates a significantly reduced Windows 11 image. However, **it's not suitable for regular
+use due to its lack of serviceability - you can't add languages, updates, or features post-creation**. The
+core build is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful
+for VM environments.
 
 ---
 
-## ⚠️ Script versions:
-- **tiny11maker.ps1** : The regular script, which removes a lot of bloat but keeps the system serviceable. You can add languages, updates, and features post-creation. This is the recommended script for regular use.
-- ⚠️ **tiny11coremaker.ps1** : The core script, which removes even more bloat but also removes the ability to service the image. You cannot add languages, updates, or features post-creation. This is recommended for quick testing or development use.
+## ⚠️ One script, two build modes:
+- **Serviceable build** (default) : removes a lot of bloat but keeps the system serviceable. You can add
+  languages, updates, and features post-creation. This is the recommended mode for regular use.
+- ⚠️ **Core build** (`-Core` switch) : removes even more bloat but also removes the ability to service the
+  image. You cannot add languages, updates, or features post-creation. Recommended for quick testing or
+  development use, e.g. VMs.
+
+There used to be a separate `tiny11coremaker.ps1` script for the core build. It has been folded into
+`asl-win11maker.ps1` behind the `-Core` switch — there is now only one script.
 
 ## Instructions:
 1. Download Windows 11 from the [Microsoft website](https://www.microsoft.com/software-download/windows11) or [Rufus](https://github.com/pbatard/rufus)
@@ -33,14 +42,17 @@ Set-ExecutionPolicy Bypass -Scope Process
 
 6. Start the script :
 ```powershell
-C:/path/to/your/tiny11/script.ps1 -ISO <letter> -SCRATCH <letter>
-``` 
-> You can see of the script by running the `get-help` command.
+.\asl-win11maker.ps1 -ISO <letter> -SCRATCH <letter>
+```
+For a core build, add `-Core`. To skip the interactive index prompt, pass `-INDEX <n>` (and `-ESDINDEX <n>`
+if the source media ships an ESD). See `Get-Help .\asl-win11maker.ps1 -Full` for every parameter, including
+the hardware-bypass strategy (`-BypassMode`) and driver injection (`-InjectSystemDrivers`, `-DriverPath`,
+`-InjectVirtioDrivers`).
 
-6. Select the drive letter where the image is mounted (only the letter, no colon (:))
-7. Select the SKU that you want the image to be based.
+6. Select the drive letter where the image is mounted (only the letter, no colon (:)), if you didn't pass `-ISO`.
+7. Select the SKU that you want the image to be based on, if you didn't pass `-INDEX`.
 8. Sit back and relax :)
-9. When the image is completed, you will see it in the folder where the script was extracted, with the name tiny11.iso
+9. When the image is completed, you will see it in the `output\` folder, alongside a build-info JSON.
 
 ---
 
@@ -48,8 +60,8 @@ C:/path/to/your/tiny11/script.ps1 -ISO <letter> -SCRATCH <letter>
 <table>
   <tbody>
     <tr>
-      <th>Tiny11maker</th>
-      <th>Tiny11coremaker</th>
+      <th>Serviceable build (default)</th>
+      <th>Core build (<code>-Core</code>)</th>
     </tr>
     <tr>
       <td>
@@ -73,27 +85,31 @@ C:/path/to/your/tiny11/script.ps1 -ISO <letter> -SCRATCH <letter>
           <li>Your Phone</li>
           <li>Media Player</li>
           <li>QuickAssist</li>
-          <li>Internet Explorer</li>
-          <li>Tablet PC Math</li>
-          <li>Edge</li>
+          <li>Edge (files + uninstall entries, opt-in)</li>
           <li>OneDrive</li>
         </ul>
       </td>
       <td>
         <ul>
-          <li>all from regular tiny +</li>
-          <li>Windows Component Store (WinSxS)</li>
-          <li>Windows Defender (only disabled, can be enabled back if needed)</li>
-          <li>Windows Update (wouldn't work without WinSxS, enabling it would put the system in a state of failure)</li>
+          <li>everything from the serviceable build, and forced on regardless of the opt-in comments, plus:</li>
+          <li>Windows Component Store (WinSxS), stripped to an essential allowlist</li>
+          <li>Windows Defender (services disabled, Settings pages hidden)</li>
+          <li>Windows Update (aggressively disabled - wouldn't work without WinSxS anyway)</li>
           <li>WinRE</li>
+          <li>Internet Explorer, WordPad, Tablet PC Math, Steps Recorder, and other system (CBS/FoD) components</li>
+          <li>Edge WebView2's WinSxS assembly, in addition to the files removed by the serviceable build's Edge removal</li>
         </ul>
       </td>
     </tr>
   </tbody>
 </table>
 
-Keep in mind that **you cannot add back features in tiny11 core**! <br>
-You will be asked during image creation if you want to enable .net 3.5 support!
+See `docs/tweak-catalog.md` for the complete, documented list of every app package prefix, scheduled task,
+and registry tweak this repo applies (and the ones it ships commented-out or doesn't port at all).
+
+Keep in mind that **you cannot add back features in the core build**! <br>
+You will be asked during image creation if you want to enable .NET 3.5 support (or pass `-EnableDotNet35`
+to skip the prompt).
 
 ---
 
@@ -108,6 +124,8 @@ You will be asked during image creation if you want to enable .net 3.5 support!
 ## Features to be implemented:
 - ~~disabling telemetry~~ (Implemented in the 04-29-24 release!)
 - ~~more ad suppression~~ (Partially implemented in the 09-06-25 release!)
+- ~~driver injection (host system + KVM/QEMU virtio)~~ (Implemented alongside the combined-builder release!)
+- ~~selectable hardware-bypass strategy~~ (Implemented alongside the combined-builder release!)
 - improved language and arch detection
 - more flexibility in what to keep and what to delete
 - maybe a GUI???

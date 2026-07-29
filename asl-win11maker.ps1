@@ -12,15 +12,68 @@
 .PARAMETER SCRATCH
     Drive letter of the desired scratch disk (eg: D)
 
+.PARAMETER INDEX
+    Install.wim image index to build from. Prompts interactively when omitted.
+
+.PARAMETER ESDINDEX
+    Source install.esd image index to convert, when the source media ships an ESD
+    instead of a WIM. Prompts interactively when omitted.
+
+.PARAMETER BypassMode
+    Windows 11 hardware-check bypass strategy: None (default), Hive (offline registry
+    edit, applied to install.wim and boot.wim), Unattend (Rufus-style RunSynchronousCommand
+    entries embedded in autounattend.xml), or Both.
+
+.PARAMETER Core
+    Build the stripped, non-serviceable "core" image instead of the regular serviceable
+    build (strips WinSxS/Windows Update/WinRE/Defender; cannot add updates, languages, or
+    features afterward).
+
+.PARAMETER InjectSystemDrivers
+    Export drivers from the currently running host system and inject them into both
+    install.wim and boot.wim.
+
+.PARAMETER DriverPath
+    Additional local folder of drivers to inject into both install.wim and boot.wim.
+
+.PARAMETER InjectVirtioDrivers
+    Inject KVM/QEMU virtio-win drivers into install.wim and boot.wim, and stage the
+    virtio guest tools to install at first logon (see -SkipVirtioGuestTools).
+
+.PARAMETER VirtioIso
+    Source for the virtio drivers: a drive letter of an already-mounted virtio-win ISO,
+    a path to a virtio-win .iso file, or an already-extracted folder. When omitted, the
+    latest stable virtio-win.iso is downloaded automatically.
+
+.PARAMETER SkipVirtioGuestTools
+    When -InjectVirtioDrivers is set, skip staging the virtio-win-guest-tools first-logon
+    install and only inject the drivers themselves.
+
+.PARAMETER EnableDotNet35
+    Core build only: enable .NET Framework 3.5 from the source media. Prompts
+    interactively when omitted.
+
 .EXAMPLE
     .\asl-win11maker.ps1 E D
     .\asl-win11maker.ps1 -ISO E -SCRATCH D
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -BypassMode Hive -InjectVirtioDrivers
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -Core
 #>
 
 #---------[ Parameters ]---------#
 param (
     [ValidatePattern('^[c-zC-Z]$')][string]$ISO,
-    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH
+    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH,
+    [int]$INDEX,
+    [int]$ESDINDEX,
+    [ValidateSet('None', 'Hive', 'Unattend', 'Both')][string]$BypassMode = 'None',
+    [switch]$Core,
+    [switch]$InjectSystemDrivers,
+    [string]$DriverPath,
+    [switch]$InjectVirtioDrivers,
+    [string]$VirtioIso,
+    [switch]$SkipVirtioGuestTools,
+    [switch]$EnableDotNet35
 )
 
 if (-not $SCRATCH) {
@@ -30,6 +83,7 @@ if (-not $SCRATCH) {
 }
 
 $script:EntryScriptPath = $PSCommandPath
+$script:EntryBoundParameters = $PSBoundParameters
 
 $functionsScriptPath = Join-Path $PSScriptRoot 'asl-win11.functions.ps1'
 if (-not (Test-Path -Path $functionsScriptPath)) {
@@ -49,15 +103,31 @@ try {
 #---------[ Main Workflow ]---------#
 # REQUIRED SETUP STEPS (do not comment out)
 Confirm-ExecutionPolicy        # REQUIRED: ensure script execution policy allows running
-Confirm-AdminPrivileges        # REQUIRED: relaunch as admin if needed
+Confirm-AdminPrivileges        # REQUIRED: relaunch as admin if needed (forwards all bound parameters)
 Confirm-AutounattendXml        # REQUIRED: ensure autounattend.xml is present locally
 Initialize-Tiny11Session       # REQUIRED: initialize paths, transcript, and session state
+Show-CoreBuildWarning          # REQUIRED: no-op unless -Core; prints the non-serviceable-image warning
 Resolve-SourceDriveLetter      # REQUIRED: resolve/validate source ISO drive letter
-Confirm-InstallWimSource       # REQUIRED: ensure install.wim exists (or convert install.esd)
+Confirm-InstallWimSource       # REQUIRED: ensure install.wim exists (or convert install.esd, honoring -ESDINDEX)
 Copy-SourceImageFiles          # REQUIRED: copy source media into scratch working folder
-Select-InstallImageIndex       # REQUIRED: choose the install image index to modify
+Resolve-InstallImageIndex      # REQUIRED: choose the install image index to modify (honors -INDEX)
 Mount-InstallImage             # REQUIRED: mount install.wim to working directory
 Show-ImageMetadata             # REQUIRED: print selected image language/architecture info
+Initialize-PreparedAnswerFile  # REQUIRED: prepare autounattend.xml once for every consumer (Sysprep copy, ISO root, Unattend bypass)
+
+# DRIVER INJECTION (install.wim) - SWITCH-GATED: controlled by -InjectSystemDrivers /
+# -DriverPath / -InjectVirtioDrivers, not by commenting these out.
+if ($InjectSystemDrivers) {
+    Export-HostSystemDrivers | Out-Null
+    Add-DriversToImage -MountPath $script:mountDir -DriverPath $script:hostDriverPath -Label 'install.wim (host)'
+}
+if ($DriverPath) {
+    Add-DriversToImage -MountPath $script:mountDir -DriverPath $DriverPath -Label 'install.wim (custom)'
+}
+if ($InjectVirtioDrivers) {
+    $script:virtioRoot = Resolve-VirtioDriverSource -VirtioIso $VirtioIso
+    Add-VirtioDriversToImage -MountPath $script:mountDir -VirtioRoot $script:virtioRoot
+}
 
 Write-Output "Mounting complete! Performing removal of applications..."
 
@@ -81,6 +151,7 @@ $appPackagePrefixes = @(
     'Microsoft.MicrosoftSolitaireCollection'   # Microsoft Solitaire Collection game
     'Microsoft.MicrosoftStickyNotes'           # Sticky Notes app
     'Microsoft.MixedReality.Portal'            # Mixed Reality Portal (VR/AR)
+    # 'Microsoft.MPEG2VideoExtension'            # tiny11-automated: MPEG-2 video playback extension
     # 'Microsoft.MSPaint'                        # Paint 3D (legacy MSPaint UWP)
     'Microsoft.Office.OneNote'                 # OneNote UWP app
     'Microsoft.OfficePushNotificationUtility'  # Office push notification background service
@@ -88,12 +159,21 @@ $appPackagePrefixes = @(
     # 'Microsoft.Paint'                          # Paint app (modern)
     'Microsoft.People'                         # People contacts app
     'Microsoft.PowerAutomateDesktop'           # Power Automate Desktop (RPA tool)
+    # 'Microsoft.Recall'                         # tiny11-automated: Windows Recall (older package name)
+    # 'Microsoft.ScreenSketch'                   # tiny11-automated: Snip & Sketch screenshot tool
     'Microsoft.SkypeApp'                       # Skype UWP app
     'Microsoft.StartExperiencesApp'            # Start menu experiences / recommendations app
+    # 'Microsoft.StorePurchaseApp'               # tiny11-automated: Microsoft Store purchase/checkout helper
     'Microsoft.Todos'                          # Microsoft To Do task manager
     'Microsoft.Wallet'                         # Microsoft Wallet (NFC payments)
+    # 'Microsoft.WebMediaExtensions'             # tiny11-automated: web media codec extensions
     'Microsoft.Windows.DevHome'                # Dev Home developer dashboard app
+    # 'Microsoft.Windows.AI'                     # tiny11-automated: Windows AI platform component
+    # 'Microsoft.Windows.AIFabric'                # tiny11-automated: Windows AI Fabric runtime
     'Microsoft.Windows.Copilot'                # Windows Copilot integration
+    # 'Microsoft.Windows.CoreAI'                 # tiny11-automated: Windows Core AI component
+    # 'Microsoft.Windows.Photos'                  # tiny11-automated: Photos app
+    # 'Microsoft.Windows.Recall'                  # tiny11-automated: Windows Recall (current package name)
     'Microsoft.Windows.Teams'                  # Microsoft Teams (Chat) integration
     'Microsoft.WindowsAlarms'                  # Alarms & Clock app
     'Microsoft.WindowsCamera'                  # Camera app
@@ -102,6 +182,7 @@ $appPackagePrefixes = @(
     'Microsoft.WindowsMaps'                    # Windows Maps app
     'Microsoft.WindowsSoundRecorder'           # Sound Recorder / Voice Recorder app
     # 'Microsoft.WindowsTerminal'                # Windows Terminal app
+    # 'MicrosoftWindows.Client.WebExperience'    # tiny11-automated: Widgets board
     'Microsoft.Xbox.TCUI'                      # Xbox Title-Callable UI (game overlay helper)
     'Microsoft.XboxApp'                        # Xbox Console Companion app
     'Microsoft.XboxGameOverlay'                # Xbox Game Overlay (in-game UI)
@@ -124,6 +205,27 @@ $scheduledTaskPaths = @(
     'Microsoft\Windows\Application Experience\ProgramDataUpdater'                 # Updates compatibility telemetry data cache
     'Microsoft\Windows\Chkdsk\Proxy'                                              # Chkdsk proxy - notifies user about filesystem errors
     'Microsoft\Windows\Windows Error Reporting\QueueReporting'                    # Sends crash/error reports to Microsoft
+    # 'Microsoft\Windows\InstallService'                                            # winutil: Store/Push-Button-Reset install service tasks
+    # 'Microsoft\Windows\UpdateOrchestrator'                                        # winutil: Update Orchestrator scheduled tasks
+    # 'Microsoft\Windows\UpdateAssistant'                                           # winutil: Update Assistant scheduled tasks
+    # 'Microsoft\Windows\WaaSMedic'                                                 # winutil: WaaS Medic self-repair scheduled tasks
+    # 'Microsoft\Windows\WindowsUpdate'                                             # winutil: Windows Update scheduled tasks
+    # 'Microsoft\WindowsUpdate'                                                     # winutil: legacy Windows Update scheduled tasks
+)
+
+# Core-build-only: Windows system component (CBS/FoD) packages, removed via
+# Remove-SystemPackages under -Core. Not used by the serviceable build. Four more
+# per-language patterns (handwriting/OCR/speech/text-to-speech) are added automatically
+# from the detected image language.
+$systemPackagePatterns = @(
+    'Microsoft-Windows-InternetExplorer-Optional-Package~31bf3856ad364e35'      # Internet Explorer 11 legacy browser (optional compatibility feature)
+    'Microsoft-Windows-Kernel-LA57-FoD-Package~31bf3856ad364e35~amd64'          # 5-Level Paging (LA57) kernel support - not needed for most hardware
+    'Microsoft-Windows-MediaPlayer-Package~31bf3856ad364e35'                    # Windows Media Player legacy app
+    'Microsoft-Windows-Wallpaper-Content-Extended-FoD-Package~31bf3856ad364e35' # Extended wallpaper collection (extra desktop backgrounds)
+    'Windows-Defender-Client-Package~31bf3856ad364e35~'                        # Windows Defender antivirus client package
+    'Microsoft-Windows-WordPad-FoD-Package~'                                   # WordPad rich text editor (legacy app)
+    'Microsoft-Windows-TabletPCMath-Package~'                                  # Tablet PC Math Input Panel (equation handwriting)
+    'Microsoft-Windows-StepsRecorder-Package~'                                 # Steps Recorder (Problem Steps Recorder - PSR)
 )
 
 # REQUIRED CUSTOMIZATION STEP (do not comment out)
@@ -133,14 +235,25 @@ Remove-ProvisionedAppPackages -ImagePath $script:mountDir -PackagePrefixes $appP
 Remove-OneDriveSetup -MountDir $script:mountDir -AdminGroupName $script:adminGroupName            # OPTIONAL: remove OneDrive setup executable
 Remove-IsoSupportFolder -ContentRoot $script:tiny11Root                                           # OPTIONAL: drop support\ folder to shrink final ISO
 
+# CORE-BUILD-ONLY FILE CUSTOMIZATION (needs no registry hives; runs before Mount-OfflineRegistryHives)
+if ($Core) {
+    Remove-SystemPackages -MountDir $script:mountDir -PackagePatterns $systemPackagePatterns -LanguageCode $script:languageCode
+    if (Confirm-DotNet35Enablement) {
+        Enable-DotNet35 -MountDir $script:mountDir -SourceRoot $script:tiny11Root
+    }
+    Remove-EdgeWebViewWinSxS -MountDir $script:mountDir -Architecture $script:architecture -AdminGroupName $script:adminGroupName
+    Remove-WindowsRecoveryEnvironment -MountDir $script:mountDir
+    Compress-WinSxS -MountDir $script:mountDir -Architecture $script:architecture -AdminGroupName $script:adminGroupName
+}
+
 # REQUIRED REGISTRY PHASE BOUNDARIES (do not comment out)
 Mount-OfflineRegistryHives                                                                        # REQUIRED: load offline hives before registry tweaks
 
 # OPTIONAL REGISTRY TWEAKS (safe to comment out)
-# Set-BypassHardwareChecks                                                                        # OPTIONAL: apply setup hardware bypass keys to install.wim
-# Remove-Edge -MountDir $script:mountDir -AdminGroupName $script:adminGroupName                   # OPTIONAL: remove Edge files and offline uninstall entries
+Invoke-HardwareBypassStrategy                                                                     # REQUIRED: apply hardware bypass chosen via -BypassMode (default: None = no-op)
+# Remove-Edge -MountDir $script:mountDir -AdminGroupName $script:adminGroupName                   # OPTIONAL: remove Edge files and offline uninstall entries (always applied under -Core, below)
 Disable-SponsoredApps                                                                             # OPTIONAL: disable suggested/sponsored consumer content
-Enable-LocalAccountOOBE -MountDir $script:mountDir -ScriptRoot $PSScriptRoot                     # OPTIONAL: enable local account path during OOBE
+Enable-LocalAccountOOBE -MountDir $script:mountDir                                                # OPTIONAL: enable local account path during OOBE
 Disable-ReservedStorage                                                                           # OPTIONAL: disable reserved storage allocation
 Disable-BitLockerAutoEncryption                                                                   # OPTIONAL: prevent automatic device encryption
 Disable-ChatIcon                                                                                  # OPTIONAL: hide chat/teams taskbar icon
@@ -150,14 +263,29 @@ Disable-DevHomeOutlookInstall                                                   
 Disable-Copilot                                                                                   # OPTIONAL: disable Copilot and related integrations
 Disable-TeamsInstall                                                                              # OPTIONAL: prevent Teams auto-installation
 Disable-NewOutlook                                                                                # OPTIONAL: block new Outlook app execution
+# Disable-WindowsUpdate                                                                            # OPTIONAL: aggressive WU suppression - see docs/tweak-catalog.md (always applied under -Core, below)
+# Disable-DiagnosticServices                                                                       # OPTIONAL: disable DiagTrack/WerSvc/PcaSvc/SysMain services
+# Disable-WindowsAI                                                                                # OPTIONAL: disable Windows AI / Recall data analysis
+
+if ($InjectVirtioDrivers -and -not $SkipVirtioGuestTools) {
+    Install-VirtioGuestToolsAtFirstLogon -MountDir $script:mountDir -VirtioRoot $script:virtioRoot  # SWITCH-GATED: -InjectVirtioDrivers (and not -SkipVirtioGuestTools)
+}
+
+# CORE-BUILD-ONLY REGISTRY TWEAKS (need offline hives loaded)
+if ($Core) {
+    Remove-Edge -MountDir $script:mountDir -AdminGroupName $script:adminGroupName
+    Disable-WindowsUpdate
+    Disable-WindowsDefender
+}
+
 Remove-ScheduledTasks -MountDir $script:mountDir -TaskPaths $scheduledTaskPaths                  # OPTIONAL: remove selected telemetry/reporting task files
 
 # REQUIRED REGISTRY PHASE BOUNDARY (do not comment out)
 Dismount-OfflineRegistryHives                                                                     # REQUIRED: unload offline hives before image finalization
 
 # REQUIRED FINALIZE/BUILD STEPS (do not comment out)
-Complete-InstallImage      # REQUIRED: cleanup, unmount, and export updated install image
-Set-BootImageBypassTweaks  # REQUIRED: apply setup bypass tweaks in boot.wim index 2
+Complete-InstallImage      # REQUIRED: cleanup, unmount, export updated install image (exports to install.esd instead under -Core)
+Update-BootImage           # REQUIRED: mount boot.wim once for bypass tweaks, driver injection, and (Core) the setup CmdLine key
 New-Tiny11Iso              # REQUIRED: build final ISO using oscdimg
 Write-BuildInfo -OutputPath (Join-Path $PSScriptRoot 'output\asl-win11-buildinfo.json')  # OPTIONAL: emit build metadata JSON
 Invoke-Tiny11Cleanup       # REQUIRED: remove temp files and eject mounted source media

@@ -18,7 +18,14 @@ see `CLAUDE.md` for the "reference-only, do not edit" policy.
 
 ## 1. Four-way feature matrix
 
-| Feature | asl-win11 | ntdevlabs | tiny11-automated (headless) | winutil |
+> **Status note:** every §4 integration below has now been ported into asl-win11 (as of the combined-builder
+> work — driver injection, namespace-aware answer-file editing, edition enforcement, `support\` removal, the
+> 6 extra scheduled tasks, the merged WU/telemetry tweak set, a selectable hardware-bypass strategy, and
+> top-level error handling). The **asl-win11 column below is left as originally written**, describing the
+> pre-combined-builder state, so this table still accurately documents what was learned from each reference
+> tool. For asl-win11's *current* state, see `docs/tweak-catalog.md` and `CLAUDE.md` instead.
+
+| Feature | asl-win11 (pre-combined-builder) | ntdevlabs | tiny11-automated (headless) | winutil |
 | --- | --- | --- | --- | --- |
 | **Driver injection** | ❌ none | ❌ none | ❌ none | ✅ `Export-WindowsDriver -Online` + DISM `/Add-Driver /Recurse` into install.wim **and** boot.wim index 2 |
 | **autounattend.xml handling** | Static copy; no XML parsing | Static copy; no XML parsing | Static copy; no XML parsing | ✅ Namespace-aware DOM editing (`ConvertTo-WinUtilISOAnswerFile`) — injects `/IMAGE/INDEX`, strips empty product keys |
@@ -102,43 +109,62 @@ assumes a WIM is already prepared.
 
 ## 4. Recommended integrations for asl-win11 (prioritized by impact)
 
-1. **Top-level error handling with emergency cleanup** *(High impact, low effort)* — Adopt
+> **All eight items below are now implemented** as part of the combined-builder work. Left in place as the
+> original prioritized rationale for *why* each was ported, with a ✅ note on how it landed. See
+> `docs/tweak-catalog.md` for the tweak-level detail and `CLAUDE.md` for the architecture.
+
+1. ✅ **Implemented** as `Invoke-Tiny11EmergencyCleanup` + a top-level `try/catch` in `asl-win11maker.ps1`.
+   **Top-level error handling with emergency cleanup** *(High impact, low effort)* — Adopt
    tiny11-automated's pattern: `$ErrorActionPreference = 'Stop'`, a single top-level `try/catch` around the
    pipeline in `asl-win11maker.ps1`, and an emergency handler that discards any still-mounted images
    (`Get-WindowsImage -Mounted | Dismount-WindowsImage -Discard`) and unloads registry hives before exiting.
    Today a mid-pipeline failure can leave install.wim/boot.wim mounted and hives loaded, blocking the next run.
 
-2. **autounattend.xml image-index injection** *(High impact, medium effort)* — Adopt winutil's
+2. ✅ **Implemented** as `ConvertTo-Tiny11AnswerFile`, called from `Initialize-PreparedAnswerFile`.
+   **autounattend.xml image-index injection** *(High impact, medium effort)* — Adopt winutil's
    `ConvertTo-WinUtilISOAnswerFile` approach: namespace-aware injection of `/IMAGE/INDEX` into the answer
-   file's `<MetaData>` so Setup installs the edition actually selected via `Select-InstallImageIndex`,
+   file's `<MetaData>` so Setup installs the edition actually selected via `Resolve-InstallImageIndex`,
    instead of relying on the answer file's own (possibly stale) assumptions. Directly fixes a
    correctness gap shared by all three PowerShell scripts.
 
-3. **ei.cfg / PID.txt edition enforcement** *(Medium impact, low effort)* — Add winutil's
+3. ✅ **Implemented** as `Set-Tiny11EditionConfig`.
+   **ei.cfg / PID.txt edition enforcement** *(Medium impact, low effort)* — Add winutil's
    `Write-WinUtilISOEditionConfig`-style step: write `sources\ei.cfg` pinning the selected edition and
    delete `sources\PID.txt` so Setup doesn't fall back to a stale firmware product key. Cheap, and
    prevents an edition-mismatch failure mode none of the three PowerShell scripts currently guard against.
 
-4. **`support\` folder removal from the ISO** *(Low impact, trivial effort)* — One-line size reduction,
+4. ✅ **Implemented** as `Remove-IsoSupportFolder`.
+   **`support\` folder removal from the ISO** *(Low impact, trivial effort)* — One-line size reduction,
    already proven safe by winutil.
 
-5. **Additional WU-related scheduled task removals** *(Medium impact, trivial effort)* — Add winutil's 6
+5. ✅ **Implemented**, but shipped **commented out** rather than active — see `docs/tweak-catalog.md` §2.
+   **Additional WU-related scheduled task removals** *(Medium impact, trivial effort)* — Add winutil's 6
    extra task paths (`InstallService`, `UpdateOrchestrator`, `UpdateAssistant`, `WaaSMedic`,
    `WindowsUpdate` x2) to `$scheduledTaskPaths` in `asl-win11maker.ps1` — pure additive config change, no
    new function needed.
 
-6. **Structured/leveled logging + build-info JSON** *(Medium impact, medium effort)* — Borrow
+6. ✅ **Implemented** as `Write-Log`/`Write-Phase` (structured logging) and `Write-BuildInfo` (JSON).
+   **Structured/leveled logging + build-info JSON** *(Medium impact, medium effort)* — Borrow
    tiny11-automated's `Write-Log` (leveled, dual console+file) and `Write-BuildInfo` JSON emission. Useful
    if asl-win11 is ever driven from CI or wrapped by another tool; low risk since it's additive to the
    existing `Start-Transcript` call.
 
-7. **Driver injection (`-InjectCurrentSystemDrivers`-style)** *(High impact for hardware compatibility,
+7. ✅ **Implemented** as `Export-HostSystemDrivers` + `Add-DriversToImage`, wired into both install.wim and
+   `Update-BootImage` (boot.wim), gated by `-InjectSystemDrivers`. Also went further than originally scoped:
+   added KVM/QEMU virtio-win driver injection (`Resolve-VirtioDriverSource`, `Add-VirtioDriversToImage`,
+   `Install-VirtioGuestToolsAtFirstLogon`), since boot.wim needs the virtio storage drivers or Windows Setup
+   can't see a VM's disk at all.
+   **Driver injection (`-InjectCurrentSystemDrivers`-style)** *(High impact for hardware compatibility,
    higher effort)* — Port winutil's `Export-WindowsDriver -Online` + DISM `/Add-Driver /Recurse` into
    both install.wim and boot.wim index 2. Valuable for building images targeted at specific hardware, but
    it's the largest new function to write/test of anything in this list — lower priority than the
    correctness/robustness items above unless there's an immediate need for it.
 
-8. **Dual-path hardware-bypass strategy from Rufus (optional/defensive)** *(Low-medium impact, medium
+8. ✅ **Implemented** as `Add-AnswerFileBypassCommands` (the Rufus/`Unattend` path) alongside the existing
+   `Set-BypassHardwareChecks` (the `Hive` path), selectable via the new `-BypassMode` parameter
+   (`None`/`Hive`/`Unattend`/`Both`; **default `None`** — a deliberate behavior change from always applying
+   the bypass to boot.wim). `Enable-LocalAccountOOBE` already covers the `BypassNRO` half mentioned below.
+   **Dual-path hardware-bypass strategy from Rufus (optional/defensive)** *(Low-medium impact, medium
    effort)* — Rufus's `wue.c` shows a fallback hierarchy worth knowing about even though asl-win11 already
    does direct offline-hive editing successfully: it *prefers* direct registry-hive mount/edit for the
    LabConfig bypass keys, and only falls back to embedding `reg add` commands in `RunSynchronousCommand`
