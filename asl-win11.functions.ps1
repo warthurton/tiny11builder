@@ -826,6 +826,15 @@ function Resolve-VirtioDriverSource {
         mounting (whether downloaded or a local .iso file), so cleanup can dismount it.
         Left unset when the caller passed an already-mounted drive letter or an extracted
         folder, since nothing was mounted here to undo.
+
+        The downloaded file is size-sanity-checked before mounting: fedorapeople.org (the
+        upstream virtio-win host) sits behind an "Anubis" JavaScript proof-of-work anti-bot
+        gate that serves a small HTML challenge page (with a 200 status) to non-browser
+        HTTP clients instead of the real ISO. Without this check, that HTML page gets
+        written to virtio-win.iso and only fails much later, cryptically, at
+        Mount-DiskImage ("The file or directory is corrupted and unreadable"). If the
+        auto-download keeps failing this check, download virtio-win.iso manually in a
+        browser (which can pass the JS challenge) and pass it via -VirtioIso instead.
     #>
     param (
         [string]$VirtioIso
@@ -852,8 +861,20 @@ function Resolve-VirtioDriverSource {
         $downloadDir = Join-Path $script:BuildScratchRoot 'drivers\virtio-download'
         New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
         $isoPath = Join-Path $downloadDir 'virtio-win.iso'
-        Invoke-WebRequest -Uri 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso' -OutFile $isoPath
-        Write-Host "  Downloaded virtio-win.iso to $isoPath."
+        $downloadUrl = 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso'
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $isoPath -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+
+        $minimumExpectedBytes = 100MB
+        $downloadedSize = (Get-Item $isoPath).Length
+        if ($downloadedSize -lt $minimumExpectedBytes) {
+            $preview = (Get-Content -Path $isoPath -TotalCount 1 -ErrorAction SilentlyContinue)
+            Remove-Item -Path $isoPath -Force -ErrorAction SilentlyContinue
+            throw "Downloaded virtio-win.iso is only $downloadedSize bytes (expected several hundred MB) - " +
+                "this is almost certainly an anti-bot challenge page from $downloadUrl, not the real ISO " +
+                "(first line of response: '$preview'). Download virtio-win.iso manually in a browser and " +
+                "pass it via -VirtioIso instead."
+        }
+        Write-Host "  Downloaded virtio-win.iso to $isoPath ($downloadedSize bytes)."
     }
 
     $mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
