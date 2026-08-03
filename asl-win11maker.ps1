@@ -7,17 +7,42 @@
     executes the build workflow in a clear, commentable function list.
 
 .PARAMETER ISO
-    Drive letter given to the mounted iso (eg: E)
+    Either the drive letter of an already-mounted Windows 11 ISO/DVD (eg: E), or a path to
+    a Windows 11 .iso file, which the script mounts itself via Mount-DiskImage and
+    dismounts again during cleanup. Prompts interactively (accepting either form) when
+    omitted.
 
 .PARAMETER SCRATCH
     Drive letter of the desired scratch disk (eg: D)
 
 .PARAMETER INDEX
-    Install.wim image index to build from. Prompts interactively when omitted.
+    Install.wim image index to build from. Prompts interactively when omitted. Ignored if
+    -Edition is also given.
 
 .PARAMETER ESDINDEX
     Source install.esd image index to convert, when the source media ships an ESD
-    instead of a WIM. Prompts interactively when omitted.
+    instead of a WIM. Prompts interactively when omitted. Ignored if -Edition is also given.
+
+.PARAMETER Edition
+    Look up the image index by edition name instead of a numeric -INDEX/-ESDINDEX (eg:
+    'Pro', 'Home', 'Education', 'Enterprise', 'Professional'). Matches case-insensitively
+    as a substring against either the image's friendly name (eg 'Windows 11 Pro') or its
+    DISM Edition ID (eg 'Professional', 'Core' — Home's internal edition ID), so either
+    common name works. Applies to both install.wim (-INDEX) and, when converting from
+    install.esd, the ESD source (-ESDINDEX). Errors out if the name matches zero or more
+    than one image in the source.
+
+.PARAMETER UseSourceCache
+    Cache the pristine, just-extracted install.wim/boot.wim (post ESD conversion, before
+    any removals or tweaks) under <SCRATCH>\sourcecache. When a valid cache already exists,
+    reruns restore from it instead of requiring the ISO to be mounted or re-copied — useful
+    for iterating on -BypassMode, driver injection, or the removal lists without repeating
+    the ISO extraction each time. The cache is left untouched by every build; only rebuilt
+    when missing or when -RefreshSourceCache is passed.
+
+.PARAMETER RefreshSourceCache
+    Used with -UseSourceCache: force rebuilding the cache from the mounted ISO even if one
+    already exists (e.g. after swapping in a different Windows 11 ISO).
 
 .PARAMETER BypassMode
     Windows 11 hardware-check bypass strategy: None (default), Hive (offline registry
@@ -53,19 +78,34 @@
     Core build only: enable .NET Framework 3.5 from the source media. Prompts
     interactively when omitted.
 
+.PARAMETER LocalAccountName
+    Embed a local account into autounattend.xml so OOBE creates it automatically instead of
+    requiring a Microsoft account, in the Administrators group. Its password is set to the
+    same value as the account name - deliberately, so no password generation/storage/prompt
+    handling is needed here. This means the account's password is exactly its (public)
+    username, which is fine for a disposable/dev/VM image but is not a hardening feature and
+    should never be used for an image that will be exposed to an untrusted network or user.
+
 .EXAMPLE
     .\asl-win11maker.ps1 E D
     .\asl-win11maker.ps1 -ISO E -SCRATCH D
     .\asl-win11maker.ps1 -ISO E -INDEX 6 -BypassMode Hive -InjectVirtioDrivers
     .\asl-win11maker.ps1 -ISO E -INDEX 6 -Core
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -UseSourceCache
+    .\asl-win11maker.ps1 -INDEX 6 -UseSourceCache -BypassMode Both        # rerun from cache, no -ISO needed
+    .\asl-win11maker.ps1 -ISO D:\Win11_25H2_English_x64.iso -Edition Pro  # mount the ISO file itself and pick "Pro" by name
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -LocalAccountName testvm        # local account "testvm", password "testvm"
 #>
 
 #---------[ Parameters ]---------#
 param (
-    [ValidatePattern('^[c-zC-Z]$')][string]$ISO,
+    [string]$ISO,
     [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH,
     [int]$INDEX,
     [int]$ESDINDEX,
+    [string]$Edition,
+    [switch]$UseSourceCache,
+    [switch]$RefreshSourceCache,
     [ValidateSet('None', 'Hive', 'Unattend', 'Both')][string]$BypassMode = 'None',
     [switch]$Core,
     [switch]$InjectSystemDrivers,
@@ -73,7 +113,8 @@ param (
     [switch]$InjectVirtioDrivers,
     [string]$VirtioIso,
     [switch]$SkipVirtioGuestTools,
-    [switch]$EnableDotNet35
+    [switch]$EnableDotNet35,
+    [string]$LocalAccountName
 )
 
 if (-not $SCRATCH) {
@@ -106,10 +147,9 @@ Confirm-ExecutionPolicy        # REQUIRED: ensure script execution policy allows
 Confirm-AdminPrivileges        # REQUIRED: relaunch as admin if needed (forwards all bound parameters)
 Confirm-AutounattendXml        # REQUIRED: ensure autounattend.xml is present locally
 Initialize-Tiny11Session       # REQUIRED: initialize paths, transcript, and session state
+Set-SleepPrevention            # REQUIRED: keep Windows from suspending mid-build; released before the final prompt
 Show-CoreBuildWarning          # REQUIRED: no-op unless -Core; prints the non-serviceable-image warning
-Resolve-SourceDriveLetter      # REQUIRED: resolve/validate source ISO drive letter
-Confirm-InstallWimSource       # REQUIRED: ensure install.wim exists (or convert install.esd, honoring -ESDINDEX)
-Copy-SourceImageFiles          # REQUIRED: copy source media into scratch working folder
+Initialize-SourceImage         # REQUIRED: populate scratch sources\ from the -UseSourceCache cache when valid, else from the mounted ISO (resolves drive letter, converts install.esd if needed, and copies source media)
 Resolve-InstallImageIndex      # REQUIRED: choose the install image index to modify (honors -INDEX)
 Mount-InstallImage             # REQUIRED: mount install.wim to working directory
 Show-ImageMetadata             # REQUIRED: print selected image language/architecture info

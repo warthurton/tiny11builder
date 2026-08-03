@@ -56,9 +56,20 @@ Set-ExecutionPolicy Bypass -Scope Process
 ```
 `-SCRATCH` is optional; omitting it uses `work/` under the repo root as the scratch build root.
 
+`-ISO` accepts either a drive letter of an already-mounted ISO/DVD (eg `E`) or a path to a Windows 11 `.iso`
+file, which the script mounts itself via `Mount-DiskImage` and dismounts again during cleanup — this is
+resolved in `Resolve-SourceDriveLetter`, mirroring the existing `-VirtioIso` drive-letter-or-path-or-folder
+pattern.
+
 Other parameters, all optional:
 - `-INDEX <n>` / `-ESDINDEX <n>` — pin the install.wim / install.esd image index non-interactively; prompts
-  when omitted.
+  when omitted. Ignored if `-Edition` is also given.
+- `-Edition <name>` — look up the image index by edition name instead (eg `Pro`, `Home`, `Education`,
+  `Professional`). `Resolve-EditionImageIndex` matches case-insensitively as a substring against either the
+  image's friendly name (`Windows 11 Pro`) or its DISM Edition ID (`Professional`, or `Core` for Home) — covers
+  both common naming and DISM's internal naming, which don't always agree. Applies to install.wim (via
+  `Resolve-InstallImageIndex`) and, when converting from install.esd, the ESD source too (via
+  `Confirm-InstallWimSource`). Errors out if the name matches zero or more than one image.
 - `-BypassMode None|Hive|Unattend|Both` — Windows 11 hardware-check bypass strategy. **Default is `None`** —
   this is a deliberate behavior change from the pre-combined-builder scripts, which always applied the
   LabConfig bypass to `boot.wim`. `Hive` edits the offline registry hives directly (install.wim + boot.wim);
@@ -72,6 +83,24 @@ Other parameters, all optional:
   virtio-win guest tools to install at first logon. `-VirtioIso` accepts a drive letter, an `.iso` path, or
   an extracted folder; omitting it downloads the latest stable `virtio-win.iso`.
 - `-EnableDotNet35` — core build only; enables .NET Framework 3.5 from source media without prompting.
+- `-UseSourceCache` [`-RefreshSourceCache`] — cache the pristine, just-extracted install.wim/boot.wim under
+  `<SCRATCH>\sourcecache\` and restore from it on reruns instead of re-copying from the mounted ISO (and
+  redoing the install.esd→install.wim conversion, when the source ships an ESD). Lets you iterate on
+  `-BypassMode`, driver injection, or the removal lists without repeating the slow ISO extraction each time;
+  `-ISO` becomes unnecessary once a valid cache exists. `-RefreshSourceCache` forces a rebuild from the ISO
+  (e.g. after swapping in a different Windows 11 ISO). The cache is separate from, and never mutated by, the
+  per-run working copy in `<SCRATCH>\asl-win11\` — `Complete-InstallImage` renames/deletes files in that
+  working copy in place, so reusing it directly as the cache would let one run's `-Core`/`ResetBase`/tweaks
+  silently carry into the next.
+- `-LocalAccountName <name>` — embeds a `<UserAccounts><LocalAccounts><LocalAccount>` block into
+  `autounattend.xml` (`Add-AnswerFileLocalAccount`, modeled on Rufus's `UNATTEND_SET_USER` —
+  `reference/rufus/src/wue.c:344-383`) so OOBE creates the account automatically, in Administrators,
+  instead of requiring a Microsoft account. Unlike Rufus (blank password + force-change-at-first-logon via
+  the magic Base64 "Password" placeholder), the password is set to the same value as the account name in
+  plain text — no password generation/storage logic needed, at the cost of a weak, publicly-guessable
+  password. Fine for disposable/dev/VM images; never use on an image reachable by an untrusted network or
+  user. Rejects reserved account names (`Administrator`, `Guest`, `SYSTEM`, etc.) and sanitizes disallowed
+  characters, matching Rufus's validation.
 
 There is no automated test suite — the scripts mutate a real Windows image and require admin rights plus a
 multi-GB ISO, so correctness is validated by syntax check + lint + manual runs, not unit tests.
@@ -88,13 +117,15 @@ new *always-on* tweak, follow the `OPTIONAL` pattern: implement it as a function
 then add one `OPTIONAL`-tagged call in the appropriate phase of this pipeline. When adding a new
 *parameter-controlled* feature, follow the `SWITCH-GATED` pattern instead.
 
-The pipeline shape is: resolve/validate ISO source → copy source media into scratch → mount `install.wim` →
-inject drivers into install.wim (switch-gated) → remove provisioned app packages → core-build-only file-level
-stripping (switch-gated) → load offline registry hives → apply hardware-bypass strategy → apply registry
-tweaks → core-build-only registry tweaks (switch-gated) → unload hives → DISM component cleanup +
-recovery-compressed export (→ ESD instead, for `-Core`) → `Update-BootImage` (bypass tweaks + driver
-injection + `-Core`'s `Setup\CmdLine` key, all in one boot.wim mount) → build the ISO with `oscdimg` → clean
-up temp files (incl. any virtio ISO this run mounted) and eject the source ISO.
+The pipeline shape is: prevent the system from sleeping mid-build → populate scratch source files (from the
+`-UseSourceCache` cache when valid, else resolve/validate ISO source and copy source media into scratch) →
+mount `install.wim` → inject drivers into install.wim (switch-gated) → remove provisioned app packages →
+core-build-only file-level stripping (switch-gated) → load offline registry hives → apply hardware-bypass
+strategy → apply registry tweaks → core-build-only registry tweaks (switch-gated) → unload hives → DISM
+component cleanup + recovery-compressed export (→ ESD instead, for `-Core`) → `Update-BootImage` (bypass
+tweaks + driver injection + `-Core`'s `Setup\CmdLine` key, all in one boot.wim mount) → build the ISO with
+`oscdimg` → clean up temp files (incl. any virtio ISO this run mounted), release the sleep-prevention request,
+and eject the source ISO (skipped if this run used the source cache and never mounted one).
 
 Three arrays near the top of the script are the primary customization surface — comment out an entry to keep
 that package/task/component in the final image instead of touching the pipeline logic:
@@ -130,8 +161,9 @@ Loosely grouped:
   `Remove-IsoSupportFolder`; core-build-only: `Remove-SystemPackages`, `Remove-EdgeWebViewWinSxS`,
   `Remove-WindowsRecoveryEnvironment`, `Compress-WinSxS`, `Enable-DotNet35`
 - **Answer file / edition**: `Get-AnswerFileChildElement`, `ConvertTo-Tiny11AnswerFile` (injects
-  `/IMAGE/INDEX`), `Add-AnswerFileBypassCommands` (Rufus-style `Unattend` bypass mode), `Set-Tiny11EditionConfig`
-  (ei.cfg/PID.txt)
+  `/IMAGE/INDEX`), `Add-AnswerFileBypassCommands` (Rufus-style `Unattend` bypass mode),
+  `Add-AnswerFileLocalAccount` (Rufus-style `-LocalAccountName` local account, password = account name),
+  `Set-Tiny11EditionConfig` (ei.cfg/PID.txt)
 - **Driver injection**: `Add-DriversToImage`, `Export-HostSystemDrivers`, `Resolve-VirtioDriverSource`,
   `Add-VirtioDriversToImage`, `Install-VirtioGuestToolsAtFirstLogon`
 - **Registry/behavior tweaks**: `Disable-*` / `Enable-*` functions (telemetry, Copilot, Teams, sponsored apps,
@@ -141,17 +173,38 @@ Loosely grouped:
   `Disable-WindowsDefender`, `Set-BootImageSetupCmdLine`
 - **Session/orchestration**: `Confirm-ExecutionPolicy`, `Confirm-AdminPrivileges` (self-elevate, forwards
   every bound parameter via `$script:EntryBoundParameters`), `Confirm-AutounattendXml` (downloads it from the
-  upstream `ntdevlabs/tiny11builder` GitHub repo if missing locally), `Initialize-Tiny11Session`,
-  `Show-CoreBuildWarning`, `Resolve-SourceDriveLetter`, `Confirm-InstallWimSource` (handles ESD→WIM
-  conversion, honors `-ESDINDEX`), `Copy-SourceImageFiles`, `Resolve-InstallImageIndex` (honors `-INDEX`),
-  `Mount-InstallImage`, `Show-ImageMetadata`, `Initialize-PreparedAnswerFile` (prepares `autounattend.xml`
-  once so the Sysprep copy, ISO-root copy, and Unattend bypass mode never drift apart),
+  upstream `ntdevlabs/tiny11builder` GitHub repo if missing locally), `Set-SleepPrevention` /
+  `Clear-SleepPrevention` (P/Invoke `SetThreadExecutionState` so a multi-hour build doesn't get frozen by
+  Windows suspending the machine mid-DISM-operation; `Clear-SleepPrevention` is called before the final
+  `Invoke-Tiny11Cleanup` prompt so it's fine for the system to sleep while idle there),
+  `Initialize-Tiny11Session`, `Show-CoreBuildWarning`, `Initialize-SourceImage` (dispatches to the
+  `-UseSourceCache` cache via `Test-SourceCachePopulated` when valid, else calls the three functions below and
+  refreshes the cache), `Resolve-SourceDriveLetter` (accepts a drive letter or a `.iso` path — mounts the
+  latter via `Mount-DiskImage` and sets `$script:sourceIsoMountedPath`, mirroring `Resolve-VirtioDriverSource`),
+  `Resolve-EditionImageIndex` (name→index lookup backing `-Edition`, shared by `Confirm-InstallWimSource`'s ESD
+  path and `Resolve-InstallImageIndex`'s install.wim path), `Confirm-InstallWimSource` (handles ESD→WIM
+  conversion, honors `-Edition` then `-ESDINDEX`), `Copy-SourceImageFiles`, `Resolve-InstallImageIndex` (honors
+  `-Edition` then `-INDEX`), `Mount-InstallImage`, `Show-ImageMetadata`, `Initialize-PreparedAnswerFile`
+  (prepares `autounattend.xml` once, injecting the image index and, when `-LocalAccountName` is given, the
+  local account, so the Sysprep copy, ISO-root copy, and Unattend bypass mode never drift apart),
   `Mount-OfflineRegistryHives` / `Dismount-OfflineRegistryHives`, `Complete-InstallImage` (calls
   `Export-CoreInstallEsd` under `-Core`), `Update-BootImage`, `New-Tiny11Iso`, `Write-BuildInfo`,
-  `Invoke-Tiny11Cleanup`, `Invoke-Tiny11EmergencyCleanup`, `Confirm-DotNet35Enablement`
+  `Invoke-Tiny11Cleanup` (dismounts `$script:sourceIsoMountedPath` by path when this run mounted the source ISO
+  itself; falls back to ejecting `$script:DriveLetter`'s volume when the caller passed an already-mounted
+  drive letter instead; skips both when `$script:DriveLetter` was never set, i.e. this run restored from the
+  source cache), `Invoke-Tiny11EmergencyCleanup`, `Confirm-DotNet35Enablement`
 
 ### Working directories (all gitignored)
 - `work/` — default scratch build root (source copy, mounted image contents) when `-SCRATCH` isn't given
+- `work\asl-win11\` (or `<SCRATCH>:\asl-win11\`) — per-run working copy of the source files; mounted,
+  mutated, and finalized by the pipeline each run. Removed and recreated every run regardless of
+  `-UseSourceCache` — cheap to recreate from the cache below, so nothing is lost by not preserving it.
+- `work\sourcecache\` (or `<SCRATCH>:\sourcecache\`) — only populated when `-UseSourceCache` is passed: a
+  pristine, untouched copy of `sources\install.wim`/`boot.wim` (already ESD-converted if the source shipped
+  an ESD), taken right after the first run's ISO copy and before anything mounts or mutates it. Reruns with
+  `-UseSourceCache` restore from here instead of touching the ISO, so `-ISO` becomes unnecessary. Never
+  written to except by `Initialize-SourceImage` populating or (`-RefreshSourceCache`) replacing it; not
+  touched by `Invoke-Tiny11Cleanup`.
 - `work\drivers\` (or `<SCRATCH>:\drivers\`) — staging for host-exported drivers, staged virtio drivers, and
   a downloaded `virtio-win.iso`, when driver injection is used. Removed by `Invoke-Tiny11Cleanup` /
   `Invoke-Tiny11EmergencyCleanup` alongside dismounting any virtio ISO this run mounted.

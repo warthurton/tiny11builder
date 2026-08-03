@@ -733,6 +733,117 @@ function Add-AnswerFileBypassCommands {
     return $xmlDoc.OuterXml
 }
 
+function Add-AnswerFileLocalAccount {
+    <#
+    .SYNOPSIS
+        Embeds a local-account creation block into autounattend.xml.
+    .DESCRIPTION
+        Rufus-style local account creation (reference/rufus/src/wue.c:344-383): adds
+        <UserAccounts><LocalAccounts><LocalAccount> under the oobeSystem pass's
+        Microsoft-Windows-Shell-Setup component, in Administrators, appended after
+        whatever that component already has (matching Rufus's own OOBE-then-UserAccounts
+        order, which is the order actually exercised in practice).
+
+        Deliberately does NOT follow Rufus's blank-password / "change at first logon" flow
+        (wue.c:363-382, which needs a magic Base64 "Password" placeholder plus a
+        FirstLogonCommand to force a change). Setting the account's password to the same
+        value as its name means no password generation/storage/encoding logic is needed
+        here at all - the cost is a weak, publicly-guessable password, which is fine for a
+        disposable/dev image never exposed to an untrusted network or user, but this is not
+        a hardening feature.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$XmlContent,
+        [Parameter(Mandatory)][string]$AccountName
+    )
+
+    # From https://learn.microsoft.com/en-us/archive/technet-wiki/13813.localized-names-for-administrator-account-in-windows
+    # (English subset only - Rufus also blocks several localized "Administrator" spellings).
+    $unallowedAccountNames = @('Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'HelpAssistant', 'KRBTGT', 'Local', 'NONE', 'SYSTEM')
+    if ($unallowedAccountNames -contains $AccountName) {
+        throw "'$AccountName' is a reserved Windows account name and can't be used for -LocalAccountName."
+    }
+
+    $sanitizedName = $AccountName -replace '[/\\\[\]:;|=.,+*?<>%@&"]', '_'
+    if ($sanitizedName -ne $AccountName) {
+        Write-Log "Local account name '$AccountName' contained unallowed characters; sanitized to '$sanitizedName'." 'WARN'
+    }
+    if ([string]::IsNullOrWhiteSpace($sanitizedName)) {
+        throw "-LocalAccountName resolved to an empty name after sanitization."
+    }
+
+    $unattendNs = 'urn:schemas-microsoft-com:unattend'
+    $wcmNs = 'http://schemas.microsoft.com/WMIConfig/2002/State'
+
+    $xmlDoc = [xml]::new()
+    $xmlDoc.PreserveWhitespace = $true
+    $xmlDoc.LoadXml($XmlContent)
+
+    if ($xmlDoc.DocumentElement.NamespaceURI -ne $unattendNs) {
+        throw "Unexpected autounattend.xml namespace: $($xmlDoc.DocumentElement.NamespaceURI)"
+    }
+
+    $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+    $nsMgr.AddNamespace('u', $unattendNs)
+
+    $oobeSettings = $xmlDoc.SelectSingleNode('/u:unattend/u:settings[@pass="oobeSystem"]', $nsMgr)
+    if (-not $oobeSettings) {
+        $oobeSettings = $xmlDoc.CreateElement('settings', $unattendNs)
+        $oobeSettings.SetAttribute('pass', 'oobeSystem')
+        [void]$xmlDoc.DocumentElement.AppendChild($oobeSettings)
+    }
+
+    $shellSetupComponent = $oobeSettings.SelectSingleNode('u:component[@name="Microsoft-Windows-Shell-Setup"]', $nsMgr)
+    if (-not $shellSetupComponent) {
+        $shellSetupComponent = $xmlDoc.CreateElement('component', $unattendNs)
+        $shellSetupComponent.SetAttribute('name', 'Microsoft-Windows-Shell-Setup')
+        $shellSetupComponent.SetAttribute('processorArchitecture', 'amd64')
+        $shellSetupComponent.SetAttribute('publicKeyToken', '31bf3856ad364e35')
+        $shellSetupComponent.SetAttribute('language', 'neutral')
+        $shellSetupComponent.SetAttribute('versionScope', 'nonSxS')
+        [void]$oobeSettings.AppendChild($shellSetupComponent)
+    }
+
+    $existingUserAccounts = @($shellSetupComponent.SelectNodes('u:UserAccounts', $nsMgr))
+    foreach ($node in $existingUserAccounts) {
+        [void]$shellSetupComponent.RemoveChild($node)
+    }
+
+    $userAccounts = $xmlDoc.CreateElement('UserAccounts', $unattendNs)
+    $localAccounts = $xmlDoc.CreateElement('LocalAccounts', $unattendNs)
+    $localAccount = $xmlDoc.CreateElement('LocalAccount', $unattendNs)
+    $actionAttribute = $xmlDoc.CreateAttribute('wcm', 'action', $wcmNs)
+    $actionAttribute.Value = 'add'
+    [void]$localAccount.Attributes.Append($actionAttribute)
+
+    $nameElement = $xmlDoc.CreateElement('Name', $unattendNs)
+    $nameElement.InnerText = $sanitizedName
+    [void]$localAccount.AppendChild($nameElement)
+
+    $displayNameElement = $xmlDoc.CreateElement('DisplayName', $unattendNs)
+    $displayNameElement.InnerText = $sanitizedName
+    [void]$localAccount.AppendChild($displayNameElement)
+
+    $groupElement = $xmlDoc.CreateElement('Group', $unattendNs)
+    $groupElement.InnerText = 'Administrators'
+    [void]$localAccount.AppendChild($groupElement)
+
+    $passwordElement = $xmlDoc.CreateElement('Password', $unattendNs)
+    $passwordValueElement = $xmlDoc.CreateElement('Value', $unattendNs)
+    $passwordValueElement.InnerText = $sanitizedName
+    [void]$passwordElement.AppendChild($passwordValueElement)
+    $plainTextElement = $xmlDoc.CreateElement('PlainText', $unattendNs)
+    $plainTextElement.InnerText = 'true'
+    [void]$passwordElement.AppendChild($plainTextElement)
+    [void]$localAccount.AppendChild($passwordElement)
+
+    [void]$localAccounts.AppendChild($localAccount)
+    [void]$userAccounts.AppendChild($localAccounts)
+    [void]$shellSetupComponent.AppendChild($userAccounts)
+
+    return $xmlDoc.OuterXml
+}
+
 function Set-Tiny11EditionConfig {
     <#
     .SYNOPSIS
@@ -1454,6 +1565,11 @@ function Invoke-Tiny11EmergencyCleanup {
         & 'reg' 'unload' "HKLM\$hive" 2>$null | Out-Null
     }
 
+    if ($script:sourceIsoMountedPath) {
+        try {
+            Dismount-DiskImage -ImagePath $script:sourceIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+    }
     if ($script:virtioIsoMountedPath) {
         try {
             Dismount-DiskImage -ImagePath $script:virtioIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
@@ -1475,6 +1591,40 @@ function Confirm-AutounattendXml {
     }
 }
 
+function Set-SleepPrevention {
+    <#
+    .SYNOPSIS
+        Tells Windows to stay awake for the duration of the build.
+    .DESCRIPTION
+        The DISM/oscdimg phases run unattended for a long time with no user input, which
+        is exactly when Windows' idle timer suspends the machine. A suspended process is
+        frozen (not failed) until the next wake, which silently turns a 20-minute build
+        into an overnight one. SetThreadExecutionState only affects this process's calling
+        thread and is automatically released on exit, so a crash doesn't leave the system
+        pinned awake. Call Clear-SleepPrevention before any point where waiting for user
+        input is fine (e.g. the final "press Enter" prompt) so the machine can still sleep
+        there.
+    #>
+    if (-not ('Tiny11.PowerState' -as [type])) {
+        Add-Type -Namespace Tiny11 -Name PowerState -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+    }
+    # ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x1) - keep the system awake; display
+    # sleep is fine. Written as decimal (2147483649): PowerShell reinterprets 0x80000000 as a
+    # negative Int32 (sign bit set) rather than promoting to Int64, and casting that negative
+    # value to [uint32] throws - decimal literals over Int32.MaxValue don't have that problem.
+    [Tiny11.PowerState]::SetThreadExecutionState([uint32]2147483649) | Out-Null
+}
+
+function Clear-SleepPrevention {
+    if ('Tiny11.PowerState' -as [type]) {
+        # ES_CONTINUOUS (0x80000000 / 2147483648) alone - release the system-awake request.
+        [Tiny11.PowerState]::SetThreadExecutionState([uint32]2147483648) | Out-Null
+    }
+}
+
 function Initialize-Tiny11Session {
     $logsDir = Join-Path $PSScriptRoot 'logs'
     New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
@@ -1492,23 +1642,85 @@ function Initialize-Tiny11Session {
     $script:mountDir = "$script:BuildScratchRoot\scratchdir"
     $script:installWimPath = "$script:tiny11Root\sources\install.wim"
     $script:bootWimPath = "$script:tiny11Root\sources\boot.wim"
+    $script:sourceCacheRoot = "$script:BuildScratchRoot\sourcecache"
     New-Item -ItemType Directory -Force -Path "$script:tiny11Root\sources" | Out-Null
 }
 
 function Resolve-SourceDriveLetter {
+    <#
+    .SYNOPSIS
+        Resolves the Windows 11 source to a mounted drive letter.
+    .DESCRIPTION
+        -ISO may be a drive letter of an already-mounted ISO/DVD (eg 'E'), or a path to a
+        Windows 11 .iso file, which this function mounts itself via Mount-DiskImage
+        (mirroring the existing -VirtioIso / Resolve-VirtioDriverSource pattern). Sets
+        $script:sourceIsoMountedPath whenever this function did the mounting, so
+        Invoke-Tiny11Cleanup / Invoke-Tiny11EmergencyCleanup dismount it by path instead of
+        just ejecting whatever happens to be at that drive letter.
+    #>
+    $promptedSource = $ISO
     do {
-        if (-not $ISO) {
-            $script:DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"
-        } else {
-            $script:DriveLetter = $ISO
+        if (-not $promptedSource) {
+            $promptedSource = Read-Host "Please enter the drive letter for the Windows 11 image, or a path to a .iso file"
         }
-        if ($script:DriveLetter -match '^[c-zC-Z]$') {
-            $script:DriveLetter = $script:DriveLetter + ":"
+
+        if ($promptedSource -match '^[c-zC-Z]:?$') {
+            $script:DriveLetter = $promptedSource.TrimEnd(':') + ":"
             Write-Output "Drive letter set to $script:DriveLetter"
+        } elseif ($promptedSource -match '\.iso$' -and (Test-Path $promptedSource -PathType Leaf)) {
+            Write-Output "Mounting source ISO: $promptedSource"
+            $mountResult = Mount-DiskImage -ImagePath $promptedSource -PassThru
+            $mountedDriveLetter = ($mountResult | Get-Volume).DriveLetter
+            $script:DriveLetter = "$($mountedDriveLetter):"
+            $script:sourceIsoMountedPath = $promptedSource
+            Write-Output "  Mounted at $script:DriveLetter"
         } else {
-            Write-Output "Invalid drive letter. Please enter a letter between C and Z."
+            Write-Output "Invalid drive letter or ISO path. Please enter a letter between C and Z, or a path to a .iso file."
+            $script:DriveLetter = $null
         }
+
+        $promptedSource = $null
     } while ($script:DriveLetter -notmatch '^[c-zC-Z]:$')
+}
+
+function Resolve-EditionImageIndex {
+    <#
+    .SYNOPSIS
+        Finds the image index matching -Edition (eg 'Professional', 'Home', 'Education').
+    .DESCRIPTION
+        Matches case-insensitively as a substring against either the image's friendly name
+        (eg 'Windows 11 Pro') or its DISM Edition ID (eg 'Professional', 'Core') -
+        whichever the caller's input happens to match. This covers both how Windows 11
+        editions are normally referred to ('Pro', 'Home') and DISM's internal edition
+        naming, which doesn't always match ('Home' ships under Edition ID 'Core').
+        Used for both install.wim (-Edition, via Resolve-InstallImageIndex) and
+        install.esd (-Edition, via Confirm-InstallWimSource) since both are plain
+        multi-edition WIM-format images as far as DISM is concerned.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$ImagePath,
+        [Parameter(Mandatory)][string]$Edition
+    )
+
+    $images = Get-WindowsImage -ImagePath $ImagePath
+    $matchedImages = foreach ($image in $images) {
+        $wimInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$ImagePath" "/index:$($image.ImageIndex)"
+        $editionId = Get-DismInfoField -Lines ($wimInfo -split '\r?\n') -FieldName 'Edition ID'
+        if ($image.ImageName -like "*$Edition*" -or $editionId -like "*$Edition*") {
+            [PSCustomObject]@{ Index = $image.ImageIndex; Name = $image.ImageName; EditionId = $editionId }
+        }
+    }
+    $matchedImages = @($matchedImages)
+
+    if ($matchedImages.Count -eq 0) {
+        throw "No image in $ImagePath matches -Edition '$Edition'. Available editions: $(($images | ForEach-Object { $_.ImageName }) -join ', ')"
+    }
+    if ($matchedImages.Count -gt 1) {
+        throw "-Edition '$Edition' matches multiple images in ${ImagePath}: $(($matchedImages | ForEach-Object { "$($_.Index): $($_.Name)" }) -join '; '). Be more specific."
+    }
+
+    Write-Output "  Matched -Edition '$Edition' to index $($matchedImages[0].Index) ($($matchedImages[0].Name))."
+    return $matchedImages[0].Index
 }
 
 function Confirm-InstallWimSource {
@@ -1516,7 +1728,9 @@ function Confirm-InstallWimSource {
         if ((Test-Path "$script:DriveLetter\sources\install.esd") -eq $true) {
             Write-Output "Found install.esd, converting to install.wim..."
             Get-WindowsImage -ImagePath $script:DriveLetter\sources\install.esd
-            if ($ESDINDEX) {
+            if ($Edition) {
+                $esdIndex = Resolve-EditionImageIndex -ImagePath "$script:DriveLetter\sources\install.esd" -Edition $Edition
+            } elseif ($ESDINDEX) {
                 $esdIndex = $ESDINDEX
                 Write-Output "  Using ESD image index $esdIndex (from -ESDINDEX)."
             } else {
@@ -1552,16 +1766,77 @@ function Copy-SourceImageFiles {
     Write-Output '  Source image copy complete.'
 }
 
+function Test-SourceCachePopulated {
+    <#
+    .SYNOPSIS
+        Checks whether $script:sourceCacheRoot holds a usable pristine install.wim/boot.wim.
+    #>
+    (Test-Path "$script:sourceCacheRoot\sources\install.wim") -and (Test-Path "$script:sourceCacheRoot\sources\boot.wim")
+}
+
+function Initialize-SourceImage {
+    <#
+    .SYNOPSIS
+        Populates $script:tiny11Root\sources with a pristine install.wim/boot.wim, from
+        the -UseSourceCache cache when one is valid, otherwise from the mounted source ISO.
+    .DESCRIPTION
+        Replaces the old unconditional Resolve-SourceDriveLetter / Confirm-InstallWimSource
+        / Copy-SourceImageFiles sequence. Those three steps are the ones that require the
+        Windows 11 ISO to actually be mounted, and (when the source ships install.esd
+        instead of install.wim) the slow Export-WindowsImage conversion — exactly the cost
+        -UseSourceCache exists to skip on reruns.
+
+        The cache is only ever read from or replaced wholesale here; nothing downstream
+        mutates $script:sourceCacheRoot directly, because Complete-InstallImage renames and
+        deletes files in $script:tiny11Root in place. Keeping the cache a separate copy
+        means every rerun starts from the same pristine image regardless of what a prior
+        run's -Core/-BypassMode/removal-list choices did to its own working copy.
+
+        Without -UseSourceCache this behaves exactly as before: always reads from the
+        mounted ISO, and never touches the cache directory.
+    #>
+    $cacheValid = $UseSourceCache -and -not $RefreshSourceCache -and (Test-SourceCachePopulated)
+
+    if ($cacheValid) {
+        Write-Phase 'Restore source image from cache'
+        Write-Output "  Reusing cached source files from $script:sourceCacheRoot (no ISO required)."
+        Copy-Item -Path "$script:sourceCacheRoot\*" -Destination $script:tiny11Root -Recurse -Force
+        Write-Output '  Source image restore complete.'
+        return
+    }
+
+    Resolve-SourceDriveLetter
+    Confirm-InstallWimSource
+    Copy-SourceImageFiles
+
+    if ($UseSourceCache) {
+        Write-Phase 'Populate source image cache'
+        if (Test-Path $script:sourceCacheRoot) {
+            Remove-Item -Path $script:sourceCacheRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $script:sourceCacheRoot | Out-Null
+        Copy-Item -Path "$script:tiny11Root\*" -Destination $script:sourceCacheRoot -Recurse -Force
+        Write-Output "  Cached pristine source files to $script:sourceCacheRoot for future -UseSourceCache reruns."
+    }
+}
+
 function Resolve-InstallImageIndex {
     <#
     .SYNOPSIS
         Chooses the install image index to modify.
     .DESCRIPTION
-        Honors -INDEX when it names a valid index in install.wim; otherwise (or if the
-        requested index doesn't exist) falls back to the original interactive prompt
-        loop.
+        Honors -Edition first (name-based lookup via Resolve-EditionImageIndex), then
+        -INDEX when it names a valid index in install.wim; otherwise (or if the requested
+        index doesn't exist) falls back to the original interactive prompt loop.
     #>
     $imagesIndex = (Get-WindowsImage -ImagePath $script:installWimPath).ImageIndex
+
+    if ($Edition) {
+        Write-Phase 'Select image index'
+        $script:index = Resolve-EditionImageIndex -ImagePath $script:installWimPath -Edition $Edition
+        Write-Output "  Using image index $script:index (from -Edition '$Edition')."
+        return
+    }
 
     if ($INDEX -and ($imagesIndex -contains $INDEX)) {
         $script:index = $INDEX
@@ -1671,11 +1946,11 @@ function Initialize-PreparedAnswerFile {
     .SYNOPSIS
         Prepares autounattend.xml once, so every consumer sees the same content.
     .DESCRIPTION
-        Injects the selected image index and caches the result in
-        $script:preparedAutounattendXml. Enable-LocalAccountOOBE (Sysprep copy),
-        Invoke-HardwareBypassStrategy's Unattend mode, and New-Tiny11Iso (ISO root copy)
-        all read this same cached value instead of each recomputing their own copy,
-        which previously let the Sysprep and ISO-root copies drift apart.
+        Injects the selected image index and (when -LocalAccountName is given) a local
+        account, caching the result in $script:preparedAutounattendXml. Enable-LocalAccountOOBE
+        (Sysprep copy), Invoke-HardwareBypassStrategy's Unattend mode, and New-Tiny11Iso
+        (ISO root copy) all read this same cached value instead of each recomputing their
+        own copy, which previously let the Sysprep and ISO-root copies drift apart.
     #>
     Write-Phase 'Prepare autounattend.xml'
     $script:preparedAutounattendXml = Get-Content -Path "$PSScriptRoot\autounattend.xml" -Raw
@@ -1684,6 +1959,15 @@ function Initialize-PreparedAnswerFile {
         Write-Output "  Injected image index $script:index into autounattend.xml."
     } catch {
         Write-Log "Could not inject image index into autounattend.xml: $_" 'WARN'
+    }
+
+    if ($LocalAccountName) {
+        try {
+            $script:preparedAutounattendXml = Add-AnswerFileLocalAccount -XmlContent $script:preparedAutounattendXml -AccountName $LocalAccountName
+            Write-Output "  Embedded local account '$LocalAccountName' into autounattend.xml (password matches the account name)."
+        } catch {
+            Write-Log "Could not embed local account into autounattend.xml: $_" 'WARN'
+        }
     }
 }
 
@@ -1870,6 +2154,7 @@ function Write-BuildInfo {
 function Invoke-Tiny11Cleanup {
     Write-Phase 'Cleanup working files'
     Write-Output 'Creation completed! Press any key to exit the script...'
+    Clear-SleepPrevention  # the build is done - fine for the system to sleep while this prompt waits
     Read-Host "Press Enter to continue"
     Write-Output "Performing Cleanup..."
     Remove-Item -Path $script:tiny11Root -Recurse -Force | Out-Null
@@ -1888,9 +2173,19 @@ function Invoke-Tiny11Cleanup {
         Remove-Item -Path $driversRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Output "Ejecting Iso drive"
-    Get-Volume -DriveLetter $script:DriveLetter[0] | Get-DiskImage | Dismount-DiskImage
-    Write-Output "Iso drive ejected"
+    if ($script:sourceIsoMountedPath) {
+        Write-Output "Dismounting source ISO..."
+        try {
+            Dismount-DiskImage -ImagePath $script:sourceIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
+        } catch {
+            Write-Output "Could not dismount source ISO: $_"
+        }
+        Write-Output "Source ISO dismounted"
+    } elseif ($script:DriveLetter) {
+        Write-Output "Ejecting Iso drive"
+        Get-Volume -DriveLetter $script:DriveLetter[0] | Get-DiskImage | Dismount-DiskImage
+        Write-Output "Iso drive ejected"
+    }
     Write-Output "Removing oscdimg.exe..."
     Remove-Item -Path "$PSScriptRoot\oscdimg.exe" -Force -ErrorAction SilentlyContinue
     Write-Output "Removing autounattend.xml..."
