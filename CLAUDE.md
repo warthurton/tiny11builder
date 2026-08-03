@@ -76,12 +76,16 @@ Other parameters, all optional:
   `Unattend` embeds Rufus-style `reg add` commands as `RunSynchronousCommand` entries in `autounattend.xml`
   instead, for environments where direct hive access isn't available.
 - `-Core` — build the non-serviceable core image instead of the serviceable one.
-- `-InjectSystemDrivers` — export drivers from the host system and inject into install.wim + boot.wim.
-- `-DriverPath <folder>` — inject an arbitrary local driver folder into install.wim + boot.wim.
+- `-InjectSystemDrivers` — export drivers from the host system and inject the full set into install.wim;
+  the storage-class subset is also staged into `$WinpeDriver$` at the ISO root for Setup's WinPE environment
+  (see `Add-WinPEStorageDrivers`) — boot.wim itself is never mounted for this.
+- `-DriverPath <folder>` — same treatment as `-InjectSystemDrivers` but for an arbitrary local driver folder:
+  full set into install.wim, storage-class subset into `$WinpeDriver$`.
 - `-InjectVirtioDrivers` [`-VirtioIso <path>`] [`-SkipVirtioGuestTools`] — inject KVM/QEMU virtio-win drivers
-  (critical: boot.wim needs the virtio storage drivers or Setup can't see the VM disk) and stage the
-  virtio-win guest tools to install at first logon. `-VirtioIso` accepts a drive letter, an `.iso` path, or
-  an extracted folder; omitting it downloads the latest stable `virtio-win.iso`.
+  into install.wim, and stage the storage driver (viostor/vioscsi) into `$WinpeDriver$` (critical: Setup's
+  WinPE environment needs to see the VM disk before it can install to it), plus stage the virtio-win guest
+  tools to install at first logon. `-VirtioIso` accepts a drive letter, an `.iso` path, or an extracted
+  folder; omitting it downloads the latest stable `virtio-win.iso`.
 - `-EnableDotNet35` — core build only; enables .NET Framework 3.5 from source media without prompting.
 - `-UseSourceCache` [`-RefreshSourceCache`] — cache the pristine, just-extracted install.wim/boot.wim under
   `<SCRATCH>\sourcecache\` and restore from it on reruns instead of re-copying from the mounted ISO (and
@@ -101,6 +105,18 @@ Other parameters, all optional:
   password. Fine for disposable/dev/VM images; never use on an image reachable by an untrusted network or
   user. Rejects reserved account names (`Administrator`, `Guest`, `SYSTEM`, etc.) and sanitizes disallowed
   characters, matching Rufus's validation.
+- `-ProductKey <key>` — embeds a real product key into `autounattend.xml`'s `UserData/ProductKey/Key` so
+  Setup activates automatically. Optional: `autounattend.xml` always carries a `UserData/ProductKey` element
+  (empty `Key` by default) with `WillShowUI` forced to `Never`, because Windows Setup shows the blocking
+  "Enter your product key" screen (and aborts the install if that screen is Cancelled) whenever the
+  `ProductKey` element is absent entirely — even an empty one satisfies it. Same requirement Rufus works
+  around (`reference/rufus/src/wue.c:145-151`). This is what makes a fully unattended install possible without
+  a key; `-ProductKey` only matters if you want automatic activation instead of an unactivated install.
+- `-CompressionMode None|Fast|Max|Recovery` — DISM `/Export-Image /Compress` mode for the final install.wim
+  (and, under `-Core`, the install.esd conversion). **Default is `Fast`** — matches the original tiny11
+  scripts' hardcoded behavior. `Max` shrinks the image further at the cost of a much slower export;
+  `Recovery` matches the WIMBoot-style compression Windows Setup's own install.esd uses (smallest, slowest);
+  `None` skips recompression (largest, fastest — useful for quick local iteration).
 
 There is no automated test suite — the scripts mutate a real Windows image and require admin rights plus a
 multi-GB ISO, so correctness is validated by syntax check + lint + manual runs, not unit tests.
@@ -119,13 +135,15 @@ then add one `OPTIONAL`-tagged call in the appropriate phase of this pipeline. W
 
 The pipeline shape is: prevent the system from sleeping mid-build → populate scratch source files (from the
 `-UseSourceCache` cache when valid, else resolve/validate ISO source and copy source media into scratch) →
-mount `install.wim` → inject drivers into install.wim (switch-gated) → remove provisioned app packages →
+mount `install.wim` → inject drivers into install.wim, plus stage the storage-class subset into `$WinpeDriver$`
+at the ISO root for Setup's own WinPE environment (switch-gated) → remove provisioned app packages →
 core-build-only file-level stripping (switch-gated) → load offline registry hives → apply hardware-bypass
 strategy → apply registry tweaks → core-build-only registry tweaks (switch-gated) → unload hives → DISM
 component cleanup + recovery-compressed export (→ ESD instead, for `-Core`) → `Update-BootImage` (bypass
-tweaks + driver injection + `-Core`'s `Setup\CmdLine` key, all in one boot.wim mount) → build the ISO with
-`oscdimg` → clean up temp files (incl. any virtio ISO this run mounted), release the sleep-prevention request,
-and eject the source ISO (skipped if this run used the source cache and never mounted one).
+tweaks + `-Core`'s `Setup\CmdLine` key, in one boot.wim mount — no driver injection here, see above) → build
+the ISO with `oscdimg` → clean up temp files (incl. any virtio ISO this run mounted), release the
+sleep-prevention request, and eject the source ISO (skipped if this run used the source cache and never
+mounted one).
 
 Three arrays near the top of the script are the primary customization surface — comment out an entry to keep
 that package/task/component in the final image instead of touching the pipeline logic:
@@ -161,11 +179,23 @@ Loosely grouped:
   `Remove-IsoSupportFolder`; core-build-only: `Remove-SystemPackages`, `Remove-EdgeWebViewWinSxS`,
   `Remove-WindowsRecoveryEnvironment`, `Compress-WinSxS`, `Enable-DotNet35`
 - **Answer file / edition**: `Get-AnswerFileChildElement`, `ConvertTo-Tiny11AnswerFile` (injects
-  `/IMAGE/INDEX`), `Add-AnswerFileBypassCommands` (Rufus-style `Unattend` bypass mode),
+  `/IMAGE/INDEX` and `UserData/AcceptEula` + `UserData/ProductKey` with `WillShowUI` forced to `Never`, so
+  Setup's product-key screen never blocks the install; embeds `-ProductKey` when given, else an empty key),
+  `Add-AnswerFileBypassCommands` (Rufus-style `Unattend` bypass mode),
   `Add-AnswerFileLocalAccount` (Rufus-style `-LocalAccountName` local account, password = account name),
   `Set-Tiny11EditionConfig` (ei.cfg/PID.txt)
-- **Driver injection**: `Add-DriversToImage`, `Export-HostSystemDrivers`, `Resolve-VirtioDriverSource`,
-  `Add-VirtioDriversToImage`, `Install-VirtioGuestToolsAtFirstLogon`
+- **Driver injection**: `Add-DriversToImage` (install.wim only — DISM `Add-Driver`), `Export-HostSystemDrivers`,
+  `Resolve-VirtioDriverSource`, `Add-VirtioDriversToImage` (also returns its staging dir, for
+  `Add-WinPEStorageDrivers` to reuse), `Install-VirtioGuestToolsAtFirstLogon`, `Test-StorageDriverInf`
+  (storage/RAID-class heuristic: INF `Class=SCSIAdapter|HDC`, or a filename fallback covering
+  iaahci/iastor/vmd/irst/rst/viostor/vioscsi/nvme), `Copy-WinPEDriverFolder` (collision-safe copy),
+  `Add-WinPEStorageDrivers` (stages the storage-class subset of a driver source into `$WinpeDriver$` at the
+  ISO root — Windows Setup auto-loads drivers from there during its windowsPE pass, confirmed via Microsoft
+  KB2686316 to work from optical/ISO media and not just USB, so Setup can see an unusual disk controller
+  without ever mounting boot.wim; ported from winutil's `Add-WinUtilISOStagedDrivers`
+  (`reference/winutil/functions/private/Invoke-WinUtilISOScript.ps1`), which replaced its own old
+  boot.wim-mount driver injection for the same reason — avoids bloating boot.wim with every non-storage
+  driver and an extra mount/commit cycle)
 - **Registry/behavior tweaks**: `Disable-*` / `Enable-*` functions (telemetry, Copilot, Teams, sponsored apps,
   reserved storage, BitLocker auto-encryption, OneDrive sync, new Outlook, Dev Home/Outlook install,
   Windows Update, diagnostic services, Windows AI, etc.), plus `Set-BypassHardwareChecks` and the
@@ -185,10 +215,15 @@ Loosely grouped:
   path and `Resolve-InstallImageIndex`'s install.wim path), `Confirm-InstallWimSource` (handles ESD→WIM
   conversion, honors `-Edition` then `-ESDINDEX`), `Copy-SourceImageFiles`, `Resolve-InstallImageIndex` (honors
   `-Edition` then `-INDEX`), `Mount-InstallImage`, `Show-ImageMetadata`, `Initialize-PreparedAnswerFile`
-  (prepares `autounattend.xml` once, injecting the image index and, when `-LocalAccountName` is given, the
-  local account, so the Sysprep copy, ISO-root copy, and Unattend bypass mode never drift apart),
+  (prepares `autounattend.xml` once, injecting the image index, product-key handling (`-ProductKey`), and,
+  when `-LocalAccountName` is given, the local account, so the Sysprep copy, ISO-root copy, and Unattend
+  bypass mode never drift apart),
   `Mount-OfflineRegistryHives` / `Dismount-OfflineRegistryHives`, `Complete-InstallImage` (calls
-  `Export-CoreInstallEsd` under `-Core`), `Update-BootImage`, `New-Tiny11Iso`, `Write-BuildInfo`,
+  `Export-CoreInstallEsd` under `-Core`), `Update-BootImage`, `New-Tiny11Iso` (names the output ISO
+  `asl-win11_<tags>_<yyyyMMdd>.iso` via `Get-Tiny11IsoNameTag`, which sanitizes `$script:editionId` and
+  appends a tag per active non-default option — `Core`, `Bypass<Mode>`, `Virtio`, `SysDrivers`,
+  `CustomDrivers`, `LocalAcct`, `Compress<Mode>` (when `-CompressionMode` isn't the default `Fast`) — so
+  multiple ISOs in `output\` stay distinguishable at a glance), `Write-BuildInfo`,
   `Invoke-Tiny11Cleanup` (dismounts `$script:sourceIsoMountedPath` by path when this run mounted the source ISO
   itself; falls back to ejecting `$script:DriveLetter`'s volume when the caller passed an already-mounted
   drive letter instead; skips both when `$script:DriveLetter` was never set, i.e. this run restored from the

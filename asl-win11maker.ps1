@@ -55,15 +55,19 @@
     features afterward).
 
 .PARAMETER InjectSystemDrivers
-    Export drivers from the currently running host system and inject them into both
-    install.wim and boot.wim.
+    Export drivers from the currently running host system and inject the full set into
+    install.wim. The storage/RAID-class subset is also staged into $WinpeDriver$ at the ISO
+    root, which Windows Setup auto-loads during its WinPE pass - boot.wim itself is never
+    mounted for this.
 
 .PARAMETER DriverPath
-    Additional local folder of drivers to inject into both install.wim and boot.wim.
+    Additional local folder of drivers: the full set is injected into install.wim, and its
+    storage/RAID-class subset is staged into $WinpeDriver$, same as -InjectSystemDrivers.
 
 .PARAMETER InjectVirtioDrivers
-    Inject KVM/QEMU virtio-win drivers into install.wim and boot.wim, and stage the
-    virtio guest tools to install at first logon (see -SkipVirtioGuestTools).
+    Inject KVM/QEMU virtio-win drivers into install.wim, stage the storage driver
+    (viostor/vioscsi) into $WinpeDriver$ so Setup's WinPE environment can see the VM disk,
+    and stage the virtio guest tools to install at first logon (see -SkipVirtioGuestTools).
 
 .PARAMETER VirtioIso
     Source for the virtio drivers: a drive letter of an already-mounted virtio-win ISO,
@@ -86,6 +90,21 @@
     username, which is fine for a disposable/dev/VM image but is not a hardening feature and
     should never be used for an image that will be exposed to an untrusted network or user.
 
+.PARAMETER ProductKey
+    A Windows product key to embed into autounattend.xml so Setup activates automatically
+    instead of prompting. Optional even for a fully unattended install: autounattend.xml
+    always carries an (empty by default) ProductKey element with WillShowUI set to Never, so
+    Setup never shows the "Enter your product key" screen (and aborts if that screen is
+    Cancelled) regardless of whether -ProductKey is given.
+
+.PARAMETER CompressionMode
+    DISM /Export-Image /Compress mode used for the final install.wim (and, under -Core, the
+    install.esd conversion): None, Fast (default), Max, or Recovery. Fast matches the
+    original tiny11 scripts' behavior; Max shrinks the image further at the cost of a much
+    slower export; Recovery produces the same WIMBoot-style compression Windows Setup uses
+    for its own install.esd (smallest, slowest); None skips recompression entirely (largest,
+    fastest export - useful mainly for quick iteration).
+
 .EXAMPLE
     .\asl-win11maker.ps1 E D
     .\asl-win11maker.ps1 -ISO E -SCRATCH D
@@ -95,6 +114,8 @@
     .\asl-win11maker.ps1 -INDEX 6 -UseSourceCache -BypassMode Both        # rerun from cache, no -ISO needed
     .\asl-win11maker.ps1 -ISO D:\Win11_25H2_English_x64.iso -Edition Pro  # mount the ISO file itself and pick "Pro" by name
     .\asl-win11maker.ps1 -ISO E -INDEX 6 -LocalAccountName testvm        # local account "testvm", password "testvm"
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -ProductKey XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+    .\asl-win11maker.ps1 -ISO E -INDEX 6 -CompressionMode Max
 #>
 
 #---------[ Parameters ]---------#
@@ -114,7 +135,9 @@ param (
     [string]$VirtioIso,
     [switch]$SkipVirtioGuestTools,
     [switch]$EnableDotNet35,
-    [string]$LocalAccountName
+    [string]$LocalAccountName,
+    [string]$ProductKey,
+    [ValidateSet('None', 'Fast', 'Max', 'Recovery')][string]$CompressionMode = 'Fast'
 )
 
 if (-not $SCRATCH) {
@@ -155,18 +178,24 @@ Mount-InstallImage             # REQUIRED: mount install.wim to working director
 Show-ImageMetadata             # REQUIRED: print selected image language/architecture info
 Initialize-PreparedAnswerFile  # REQUIRED: prepare autounattend.xml once for every consumer (Sysprep copy, ISO root, Unattend bypass)
 
-# DRIVER INJECTION (install.wim) - SWITCH-GATED: controlled by -InjectSystemDrivers /
-# -DriverPath / -InjectVirtioDrivers, not by commenting these out.
+# DRIVER INJECTION (install.wim, plus storage-only staging into $WinpeDriver$ for Setup's
+# WinPE environment - see Add-WinPEStorageDrivers) - SWITCH-GATED: controlled by
+# -InjectSystemDrivers / -DriverPath / -InjectVirtioDrivers, not by commenting these out.
 if ($InjectSystemDrivers) {
     Export-HostSystemDrivers | Out-Null
     Add-DriversToImage -MountPath $script:mountDir -DriverPath $script:hostDriverPath -Label 'install.wim (host)'
+    Add-WinPEStorageDrivers -ContentRoot $script:tiny11Root -SourcePath $script:hostDriverPath -Label 'host'
 }
 if ($DriverPath) {
     Add-DriversToImage -MountPath $script:mountDir -DriverPath $DriverPath -Label 'install.wim (custom)'
+    Add-WinPEStorageDrivers -ContentRoot $script:tiny11Root -SourcePath $DriverPath -Label 'custom'
 }
 if ($InjectVirtioDrivers) {
     $script:virtioRoot = Resolve-VirtioDriverSource -VirtioIso $VirtioIso
-    Add-VirtioDriversToImage -MountPath $script:mountDir -VirtioRoot $script:virtioRoot
+    $virtioStagingDir = Add-VirtioDriversToImage -MountPath $script:mountDir -VirtioRoot $script:virtioRoot
+    if ($virtioStagingDir) {
+        Add-WinPEStorageDrivers -ContentRoot $script:tiny11Root -SourcePath $virtioStagingDir -Label 'virtio'
+    }
 }
 
 Write-Output "Mounting complete! Performing removal of applications..."
@@ -325,7 +354,7 @@ Dismount-OfflineRegistryHives                                                   
 
 # REQUIRED FINALIZE/BUILD STEPS (do not comment out)
 Complete-InstallImage      # REQUIRED: cleanup, unmount, export updated install image (exports to install.esd instead under -Core)
-Update-BootImage           # REQUIRED: mount boot.wim once for bypass tweaks, driver injection, and (Core) the setup CmdLine key
+Update-BootImage           # REQUIRED: mount boot.wim once for bypass tweaks and (Core) the setup CmdLine key (driver injection happens earlier, into install.wim + $WinpeDriver$ - not here)
 New-Tiny11Iso              # REQUIRED: build final ISO using oscdimg
 Write-BuildInfo -OutputPath (Join-Path $PSScriptRoot 'output\asl-win11-buildinfo.json')  # OPTIONAL: emit build metadata JSON
 Invoke-Tiny11Cleanup       # REQUIRED: remove temp files and eject mounted source media

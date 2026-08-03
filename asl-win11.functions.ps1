@@ -558,17 +558,27 @@ function Get-AnswerFileChildElement {
 function ConvertTo-Tiny11AnswerFile {
     <#
     .SYNOPSIS
-        Injects the selected install image index into autounattend.xml.
+        Injects the selected install image index and product-key handling into autounattend.xml.
     .DESCRIPTION
         Namespace-aware edit of the windowsPE/Microsoft-Windows-Setup/ImageInstall/OSImage/
         InstallFrom node so Setup installs the edition actually chosen via
         Resolve-InstallImageIndex, instead of relying on the answer file's own (possibly
-        stale) assumptions. Also strips empty/placeholder product keys so Setup doesn't
-        fail edition matching against them.
+        stale) assumptions.
+
+        Also ensures UserData/AcceptEula and UserData/ProductKey/WillShowUI are present, so
+        Setup never blocks on the "Enter your product key" screen (and aborts if that screen
+        is Cancelled). Windows Setup shows that screen whenever the ProductKey element is
+        entirely absent, even though an empty <Key/> is perfectly acceptable to it — Rufus
+        hits the same requirement (reference/rufus/src/wue.c:145-151: "WinPE will complain if
+        we don't provide a product key. *Any* product key."). Setting WillShowUI to Never
+        additionally guarantees the screen stays suppressed even if the key turns out to be
+        invalid. When -ProductKey is supplied, its value is embedded instead of an empty key,
+        letting Setup activate automatically against a real license.
     #>
     param (
         [Parameter(Mandatory)][string]$XmlContent,
-        [int]$ImageIndex = 1
+        [int]$ImageIndex = 1,
+        [string]$ProductKey = ''
     )
 
     if ($ImageIndex -lt 1) { $ImageIndex = 1 }
@@ -610,15 +620,21 @@ function ConvertTo-Tiny11AnswerFile {
         [void]$windowsPESettings.AppendChild($setupComponent)
     }
 
-    $productKeyNodes = @($setupComponent.SelectNodes('u:UserData/u:ProductKey', $nsMgr))
-    foreach ($productKeyNode in $productKeyNodes) {
-        $keyNode = $productKeyNode.SelectSingleNode('u:Key', $nsMgr)
-        $keyValue = if ($keyNode) { $keyNode.InnerText.Trim() } else { '' }
+    $userData = Get-AnswerFileChildElement -Parent $setupComponent -Name 'UserData' -NamespaceUri $unattendNs
 
-        if ([string]::IsNullOrWhiteSpace($keyValue) -or $keyValue -eq '00000-00000-00000-00000-00000') {
-            [void]$productKeyNode.ParentNode.RemoveChild($productKeyNode)
-        }
-    }
+    $acceptEulaElement = Get-AnswerFileChildElement -Parent $userData -Name 'AcceptEula' -NamespaceUri $unattendNs
+    $acceptEulaElement.InnerText = 'true'
+
+    $productKeyElement = Get-AnswerFileChildElement -Parent $userData -Name 'ProductKey' -NamespaceUri $unattendNs
+
+    $productKeyValue = if ($ProductKey) { $ProductKey.Trim() } else { '' }
+    if ($productKeyValue -eq '00000-00000-00000-00000-00000') { $productKeyValue = '' }
+
+    $productKeyKeyElement = Get-AnswerFileChildElement -Parent $productKeyElement -Name 'Key' -NamespaceUri $unattendNs
+    $productKeyKeyElement.InnerText = $productKeyValue
+
+    $willShowUiElement = Get-AnswerFileChildElement -Parent $productKeyElement -Name 'WillShowUI' -NamespaceUri $unattendNs
+    $willShowUiElement.InnerText = 'Never'
 
     $imageInstall = Get-AnswerFileChildElement -Parent $setupComponent -Name 'ImageInstall' -NamespaceUri $unattendNs
     $osImage = Get-AnswerFileChildElement -Parent $imageInstall -Name 'OSImage' -NamespaceUri $unattendNs
@@ -894,16 +910,22 @@ function Add-DriversToImage {
         Injects every driver found under a folder into a mounted image via DISM.
     .DESCRIPTION
         Thin wrapper around dism /Add-Driver /Recurse, shared by host-driver, custom
-        -DriverPath, and virtio driver injection for both install.wim and boot.wim.
+        -DriverPath, and virtio driver injection into install.wim. boot.wim no longer goes
+        through this path (see Add-WinPEStorageDrivers) - installing the full driver set
+        into WinPE would bloat boot.wim with GPU/audio/printer drivers it never needs, and
+        require an extra mount/commit cycle just to add them.
+        Uses Write-Host, not Write-Output, per this file's logging convention: callers like
+        Add-VirtioDriversToImage return a value the caller captures directly, and stray
+        Write-Output text here would corrupt that captured value.
     #>
     param (
         [string]$MountPath,
         [string]$DriverPath,
         [string]$Label
     )
-    Write-Output "  Injecting drivers into $Label from $DriverPath..."
+    Write-Host "  Injecting drivers into $Label from $DriverPath..."
     & 'dism' '/English' "/image:$MountPath" '/Add-Driver' "/Driver:$DriverPath" '/Recurse' | Out-Null
-    Write-Output "  Driver injection into $Label complete."
+    Write-Host "  Driver injection into $Label complete."
 }
 
 function Export-HostSystemDrivers {
@@ -1004,6 +1026,12 @@ function Add-VirtioDriversToImage {
         folders matching $script:architecture and w11 (falling back to w10 when a driver
         hasn't shipped a w11-specific build yet) avoids /Add-Driver /Recurse pulling in
         every other OS variant's INF files.
+
+        Returns the staging directory path so the caller can pass the same, already-staged
+        folder to Add-WinPEStorageDrivers afterward instead of re-resolving/re-copying it -
+        that call picks the storage-class subset (viostor/vioscsi) back out of everything
+        staged here for the boot-media $WinpeDriver$ drop. Returns $null when nothing was
+        staged.
     #>
     param (
         [string]$MountPath,
@@ -1036,11 +1064,129 @@ function Add-VirtioDriversToImage {
 
     if ($stagedCount -eq 0) {
         Write-Log "No virtio driver folders matched architecture '$archFolder' under $VirtioRoot; nothing staged." 'WARN'
+        return $null
+    }
+
+    Write-Host "  Staged $stagedCount virtio driver folder(s)."
+    Add-DriversToImage -MountPath $MountPath -DriverPath $stagingDir -Label 'virtio'
+    return $stagingDir
+}
+
+function Test-StorageDriverInf {
+    <#
+    .SYNOPSIS
+        Heuristically detects whether a driver .inf targets mass-storage/RAID hardware.
+    .DESCRIPTION
+        Backing check for Add-WinPEStorageDrivers: WinPE only needs to see the target disk,
+        not the full hardware set (GPU/audio/NIC/etc.), so only storage-class drivers are
+        worth staging into $WinpeDriver$. Matches the INF's Class directive against
+        SCSIAdapter/HDC, falling back to a filename pattern for driver families that are
+        commonly storage/RAID controllers but sometimes omit or vary that Class line.
+        Mirrors winutil's Test-WinUtilISOStorageDriver
+        (reference/winutil/functions/private/Invoke-WinUtilISOScript.ps1), extended with
+        viostor/vioscsi/nvme so virtio and NVMe controllers are also recognized.
+    #>
+    param ([Parameter(Mandatory)][System.IO.FileInfo]$InfFile)
+
+    if ($InfFile.BaseName -match '(?i)(iaahci|iastor|vmd|irst|rst|viostor|vioscsi|nvme)') {
+        return $true
+    }
+
+    try {
+        return (Get-Content -LiteralPath $InfFile.FullName -Raw -ErrorAction Stop) -match '(?im)^\s*Class\s*=\s*(SCSIAdapter|HDC)\s*(?:;.*)?$'
+    } catch {
+        Write-Log "Could not classify driver '$($InfFile.FullName)' for WinPE staging: $_" 'WARN'
+        return $false
+    }
+}
+
+function Copy-WinPEDriverFolder {
+    <#
+    .SYNOPSIS
+        Copies a driver package folder into a destination, avoiding name collisions.
+    .DESCRIPTION
+        Different driver sources (host export, -DriverPath, virtio) can both contain a
+        folder with the same name; appends a numeric suffix instead of overwriting.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $folderName = Split-Path $Source -Leaf
+    $targetPath = Join-Path $Destination $folderName
+    $suffix = 1
+    while (Test-Path -LiteralPath $targetPath) {
+        $targetPath = Join-Path $Destination "${folderName}_$suffix"
+        $suffix++
+    }
+
+    Copy-Item -LiteralPath $Source -Destination $targetPath -Recurse -Force
+    return $targetPath
+}
+
+function Add-WinPEStorageDrivers {
+    <#
+    .SYNOPSIS
+        Stages storage/RAID-controller drivers into $WinpeDriver$ at the ISO root.
+    .DESCRIPTION
+        Windows Setup auto-loads drivers from a $WinpeDriver$ folder at the root of the
+        installation media during its windowsPE pass - Setup.exe scans every drive letter
+        C: and above for one (Microsoft KB2686316; confirmed working from optical/ISO media,
+        not just USB) - so getting Setup to see an unusual disk controller (virtio, an
+        exotic RAID card, etc.) no longer requires mounting boot.wim and running DISM
+        Add-Driver at all. Replaces the old approach of injecting the entire driver source
+        into boot.wim via Add-DriversToImage, which bloated boot.wim with every non-storage
+        driver (GPU/audio/NIC/etc.) install.wim's own driver injection already covers for
+        the installed OS, and cost an extra mount/commit cycle.
+
+        Only drivers Test-StorageDriverInf classifies as storage/RAID are staged; everything
+        else under -SourcePath is intentionally left out. Mirrors winutil's
+        Add-WinUtilISOStagedDrivers / $WinpeDriver$ approach
+        (reference/winutil/functions/private/Invoke-WinUtilISOScript.ps1).
+
+        Per KB2686316, a driver staged here won't override one Setup already loaded into
+        boot.wim's in-memory driverstore for the same device - but that only matters when
+        boot.wim can already see the disk on its own, in which case $WinpeDriver$ was never
+        needed for that device anyway.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$ContentRoot,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath)) {
+        Write-Log "WinPE storage-driver source not found, skipping: $SourcePath" 'WARN'
         return
     }
 
-    Write-Output "  Staged $stagedCount virtio driver folder(s)."
-    Add-DriversToImage -MountPath $MountPath -DriverPath $stagingDir -Label 'virtio'
+    $driverInfs = @(Get-ChildItem -Path $SourcePath -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+    if ($driverInfs.Count -eq 0) {
+        Write-Host "  No driver INF files found under $SourcePath for $Label; nothing staged for WinPE."
+        return
+    }
+
+    $driverFolders = @($driverInfs | Group-Object { $_.Directory.FullName })
+    $winpeDriverDir = Join-Path $ContentRoot '$WinpeDriver$'
+    $stagedCount = 0
+
+    foreach ($driverFolderGroup in $driverFolders) {
+        $driverFolder = [string]$driverFolderGroup.Name
+        $storageInfs = @($driverFolderGroup.Group | Where-Object { Test-StorageDriverInf -InfFile $_ })
+        if ($storageInfs.Count -eq 0) { continue }
+
+        New-Item -Path $winpeDriverDir -ItemType Directory -Force | Out-Null
+        $target = Copy-WinPEDriverFolder -Source $driverFolder -Destination $winpeDriverDir
+        $stagedCount++
+        Write-Host "  Staged $Label storage driver package '$driverFolder' for WinPE as '$target'."
+    }
+
+    if ($stagedCount -eq 0) {
+        Write-Host "  No storage-class drivers found under $SourcePath for $Label; nothing staged for WinPE."
+    } else {
+        Write-Host "  Staged $stagedCount $Label storage driver package(s) into `$WinpeDriver`$."
+    }
 }
 
 function Install-VirtioGuestToolsAtFirstLogon {
@@ -1946,16 +2092,18 @@ function Initialize-PreparedAnswerFile {
     .SYNOPSIS
         Prepares autounattend.xml once, so every consumer sees the same content.
     .DESCRIPTION
-        Injects the selected image index and (when -LocalAccountName is given) a local
-        account, caching the result in $script:preparedAutounattendXml. Enable-LocalAccountOOBE
-        (Sysprep copy), Invoke-HardwareBypassStrategy's Unattend mode, and New-Tiny11Iso
-        (ISO root copy) all read this same cached value instead of each recomputing their
-        own copy, which previously let the Sysprep and ISO-root copies drift apart.
+        Injects the selected image index, product-key handling (-ProductKey, defaulting to
+        an empty key so Setup never blocks on the product-key screen), and (when
+        -LocalAccountName is given) a local account, caching the result in
+        $script:preparedAutounattendXml. Enable-LocalAccountOOBE (Sysprep copy),
+        Invoke-HardwareBypassStrategy's Unattend mode, and New-Tiny11Iso (ISO root copy) all
+        read this same cached value instead of each recomputing their own copy, which
+        previously let the Sysprep and ISO-root copies drift apart.
     #>
     Write-Phase 'Prepare autounattend.xml'
     $script:preparedAutounattendXml = Get-Content -Path "$PSScriptRoot\autounattend.xml" -Raw
     try {
-        $script:preparedAutounattendXml = ConvertTo-Tiny11AnswerFile -XmlContent $script:preparedAutounattendXml -ImageIndex $script:index
+        $script:preparedAutounattendXml = ConvertTo-Tiny11AnswerFile -XmlContent $script:preparedAutounattendXml -ImageIndex $script:index -ProductKey $ProductKey
         Write-Output "  Injected image index $script:index into autounattend.xml."
     } catch {
         Write-Log "Could not inject image index into autounattend.xml: $_" 'WARN'
@@ -1997,8 +2145,8 @@ function Complete-InstallImage {
     Write-Output '  Saving and unmounting install image...'
     Invoke-WithoutProgress { Dismount-WindowsImage -Path $script:mountDir -Save }
 
-    Write-Output '  Exporting optimized install image...'
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install2.wim" /Compress:recovery }
+    Write-Output "  Exporting optimized install image (Compress:$($CompressionMode.ToLower()))..."
+    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install2.wim" /Compress:$($CompressionMode.ToLower()) }
     Remove-Item -Path $script:installWimPath -Force | Out-Null
     Rename-Item -Path "$script:tiny11Root\sources\install2.wim" -NewName "install.wim" | Out-Null
     Write-Output '  Install image finalized.'
@@ -2011,13 +2159,14 @@ function Complete-InstallImage {
 function Export-CoreInstallEsd {
     <#
     .SYNOPSIS
-        Exports the finalized install.wim to a recovery-compressed install.esd.
+        Exports the finalized install.wim to an install.esd, using -CompressionMode.
     .DESCRIPTION
         Core-build-only. Matches asl-win11-coremaker.ps1's final export step; produces a
         smaller install.esd in place of install.wim for the non-serviceable image.
     #>
     Write-Phase 'Export core install image to ESD'
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install.esd" /Compress:recovery }
+    Write-Output "  Exporting install.esd (Compress:$($CompressionMode.ToLower()))..."
+    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install.esd" /Compress:$($CompressionMode.ToLower()) }
     Remove-Item -Path $script:installWimPath -Force
     Write-Output '  install.esd exported; install.wim removed.'
 }
@@ -2028,10 +2177,12 @@ function Update-BootImage {
         Mounts boot.wim index 2 and applies every setup-time tweak in one pass.
     .DESCRIPTION
         Replaces the old dedicated bypass-only boot.wim mount with a single mount that
-        handles the hardware-bypass registry tweaks (per -BypassMode), driver injection
-        (host/-DriverPath/virtio, so Windows Setup's PE environment can see the same
-        hardware as the installed image), and, for -Core builds, the Setup\CmdLine key
-        that boots straight into setup.exe.
+        handles the hardware-bypass registry tweaks (per -BypassMode) and, for -Core builds,
+        the Setup\CmdLine key that boots straight into setup.exe. Driver injection for
+        Windows Setup's PE environment no longer happens here - see Add-WinPEStorageDrivers,
+        called earlier in the pipeline alongside install.wim's own driver injection, which
+        stages storage-class drivers into $WinpeDriver$ at the ISO root instead of mounting
+        boot.wim a second time.
     #>
     Write-Phase 'Update boot image'
     Write-Output '  Continuing with boot.wim.'
@@ -2043,16 +2194,6 @@ function Update-BootImage {
     & icacls $script:bootWimPath "/grant" "$($script:adminGroupName):(F)"
     Set-ItemProperty -Path $script:bootWimPath -Name IsReadOnly -Value $false
     Invoke-WithoutProgress { Mount-WindowsImage -ImagePath $script:bootWimPath -Index 2 -Path $script:mountDir }
-
-    if ($InjectSystemDrivers -and $script:hostDriverPath) {
-        Add-DriversToImage -MountPath $script:mountDir -DriverPath $script:hostDriverPath -Label 'boot.wim (host)'
-    }
-    if ($DriverPath) {
-        Add-DriversToImage -MountPath $script:mountDir -DriverPath $DriverPath -Label 'boot.wim (custom)'
-    }
-    if ($InjectVirtioDrivers -and $script:virtioRoot) {
-        Add-VirtioDriversToImage -MountPath $script:mountDir -VirtioRoot $script:virtioRoot
-    }
 
     Write-Output '  Loading boot image registry hives...'
     reg load HKLM\zCOMPONENTS $script:mountDir\Windows\System32\config\COMPONENTS
@@ -2079,6 +2220,34 @@ function Update-BootImage {
     Clear-Host
 }
 
+function Get-Tiny11IsoNameTag {
+    <#
+    .SYNOPSIS
+        Builds a filesystem-safe "_"-joined tag string summarizing this run's key
+        build choices, for embedding in the output ISO's filename.
+    .DESCRIPTION
+        Surfaces the edition plus every build/driver/bypass/account option that makes this
+        ISO different from a stock build, so multiple output ISOs sitting in the same
+        output\ folder can be told apart without opening buildinfo JSON or re-running with
+        -Verbose. Reads $script:editionId (set by Show-ImageMetadata) and the entry script's
+        bound parameters directly by name, same as every other function in this file.
+    #>
+    $tags = [System.Collections.Generic.List[string]]::new()
+
+    if ($script:editionId) {
+        $tags.Add(($script:editionId -replace '[^A-Za-z0-9]', ''))
+    }
+    if ($Core) { $tags.Add('Core') }
+    if ($BypassMode -and $BypassMode -ne 'None') { $tags.Add("Bypass$BypassMode") }
+    if ($InjectVirtioDrivers) { $tags.Add('Virtio') }
+    if ($InjectSystemDrivers) { $tags.Add('SysDrivers') }
+    if ($DriverPath) { $tags.Add('CustomDrivers') }
+    if ($LocalAccountName) { $tags.Add('LocalAcct') }
+    if ($CompressionMode -and $CompressionMode -ne 'Fast') { $tags.Add("Compress$CompressionMode") }
+
+    return ($tags -join '_')
+}
+
 function New-Tiny11Iso {
     Write-Phase 'Build ISO image'
     Write-Output '  Writing unattended file for OOBE local account bypass...'
@@ -2089,7 +2258,12 @@ function New-Tiny11Iso {
     Write-Output '  Creating ISO image...'
     $outputDir = Join-Path $PSScriptRoot 'output'
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    $script:isoPath = "$outputDir\asl-win11_$(Get-Date -f yyyyMMdd).iso"
+    $nameTag = Get-Tiny11IsoNameTag
+    $script:isoPath = if ($nameTag) {
+        "$outputDir\asl-win11_${nameTag}_$(Get-Date -f yyyyMMdd).iso"
+    } else {
+        "$outputDir\asl-win11_$(Get-Date -f yyyyMMdd).iso"
+    }
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$script:hostArchitecture\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
