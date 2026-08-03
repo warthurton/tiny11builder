@@ -1789,6 +1789,14 @@ function Initialize-Tiny11Session {
     $script:installWimPath = "$script:tiny11Root\sources\install.wim"
     $script:bootWimPath = "$script:tiny11Root\sources\boot.wim"
     $script:sourceCacheRoot = "$script:BuildScratchRoot\sourcecache"
+
+    # Remove any debris left behind by a prior interrupted run (eg a partial
+    # sources\install2.wim from an export that never finished) before recreating -
+    # otherwise DISM's /Export-Image below can find a stale, corrupt file already sitting
+    # at its destination path and fail against it instead of writing a fresh one.
+    if (Test-Path -LiteralPath $script:tiny11Root) {
+        Remove-Item -Path $script:tiny11Root -Recurse -Force
+    }
     New-Item -ItemType Directory -Force -Path "$script:tiny11Root\sources" | Out-Null
 }
 
@@ -2146,9 +2154,14 @@ function Complete-InstallImage {
     Invoke-WithoutProgress { Dismount-WindowsImage -Path $script:mountDir -Save }
 
     Write-Output "  Exporting optimized install image (Compress:$($CompressionMode.ToLower()))..."
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install2.wim" /Compress:$($CompressionMode.ToLower()) }
+    $exportDestination = "$script:tiny11Root\sources\install2.wim"
+    Remove-Item -Path $exportDestination -Force -ErrorAction SilentlyContinue
+    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower()) }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exportDestination) -or (Get-Item -LiteralPath $exportDestination).Length -lt 1MB) {
+        throw "DISM /Export-Image of install.wim failed (exit code $LASTEXITCODE) or produced a suspiciously small file - see C:\Windows\Logs\DISM\dism.log. Leaving the original install.wim in place."
+    }
     Remove-Item -Path $script:installWimPath -Force | Out-Null
-    Rename-Item -Path "$script:tiny11Root\sources\install2.wim" -NewName "install.wim" | Out-Null
+    Rename-Item -Path $exportDestination -NewName "install.wim" | Out-Null
     Write-Output '  Install image finalized.'
 
     if ($Core) {
@@ -2166,7 +2179,12 @@ function Export-CoreInstallEsd {
     #>
     Write-Phase 'Export core install image to ESD'
     Write-Output "  Exporting install.esd (Compress:$($CompressionMode.ToLower()))..."
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$script:tiny11Root\sources\install.esd" /Compress:$($CompressionMode.ToLower()) }
+    $exportDestination = "$script:tiny11Root\sources\install.esd"
+    Remove-Item -Path $exportDestination -Force -ErrorAction SilentlyContinue
+    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower()) }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exportDestination) -or (Get-Item -LiteralPath $exportDestination).Length -lt 1MB) {
+        throw "DISM /Export-Image of install.esd failed (exit code $LASTEXITCODE) or produced a suspiciously small file - see C:\Windows\Logs\DISM\dism.log. Leaving the original install.wim in place."
+    }
     Remove-Item -Path $script:installWimPath -Force
     Write-Output '  install.esd exported; install.wim removed.'
 }
