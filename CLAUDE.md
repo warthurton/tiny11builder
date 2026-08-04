@@ -85,7 +85,12 @@ Other parameters, all optional:
   into install.wim, and stage the storage driver (viostor/vioscsi) into `$WinpeDriver$` (critical: Setup's
   WinPE environment needs to see the VM disk before it can install to it), plus stage the virtio-win guest
   tools to install at first logon. `-VirtioIso` accepts a drive letter, an `.iso` path, or an extracted
-  folder; omitting it downloads the latest stable `virtio-win.iso`.
+  folder; omitting it first looks for any already-extracted cache folder under
+  `<SCRATCH>:\virtiocache\` (from a prior run's `Expand-VirtioIso`) and reuses the most recently written one
+  with no network access, falling back to downloading the latest stable `virtio-win.iso` only when no cache
+  exists. An `.iso` path (given or downloaded) is extracted via 7-Zip (`Expand-VirtioIso`) rather than
+  mounted, into a persistent `<SCRATCH>:\virtiocache\<iso name>\` cache reused on reruns — no
+  `Mount-DiskImage`/`Dismount-DiskImage` lifecycle to track, and nothing left mounted if a run crashes.
 - `-EnableDotNet35` — core build only; enables .NET Framework 3.5 from source media without prompting.
 - `-UseSourceCache` [`-RefreshSourceCache`] — cache the pristine, just-extracted install.wim/boot.wim under
   `<SCRATCH>\sourcecache\` and restore from it on reruns instead of re-copying from the mounted ISO (and
@@ -106,12 +111,32 @@ Other parameters, all optional:
   user. Rejects reserved account names (`Administrator`, `Guest`, `SYSTEM`, etc.) and sanitizes disallowed
   characters, matching Rufus's validation.
 - `-ProductKey <key>` — embeds a real product key into `autounattend.xml`'s `UserData/ProductKey/Key` so
-  Setup activates automatically. Optional: `autounattend.xml` always carries a `UserData/ProductKey` element
-  (empty `Key` by default) with `WillShowUI` forced to `Never`, because Windows Setup shows the blocking
-  "Enter your product key" screen (and aborts the install if that screen is Cancelled) whenever the
-  `ProductKey` element is absent entirely — even an empty one satisfies it. Same requirement Rufus works
-  around (`reference/rufus/src/wue.c:145-151`). This is what makes a fully unattended install possible without
-  a key; `-ProductKey` only matters if you want automatic activation instead of an unactivated install.
+  Setup validates and auto-activates against it silently (`WillShowUI` forced to `Never`). Optional:
+  `autounattend.xml` always carries a `UserData/ProductKey` element, because Windows Setup shows the
+  blocking "Enter your product key" screen (and aborts the install if that screen is Cancelled) whenever the
+  `ProductKey` element is absent entirely. Product-key precedence when `-ProductKey` isn't given
+  (`Initialize-PreparedAnswerFile`):
+  1. **Generic Volume License Key (GVLK)** for the detected edition (`Get-GenericVolumeLicenseKey`,
+     `$script:editionId` from `Show-ImageMetadata`'s `/Get-CurrentEdition` call) — real, Microsoft-published
+     per-edition keys intended to select an edition on a generic ISO and pass Setup's validation, without
+     being a genuine license (see
+     [learn.microsoft.com/windows-server/get-started/kms-client-activation-keys](https://learn.microsoft.com/en-us/windows-server/get-started/kms-client-activation-keys)).
+     They don't activate Windows (no KMS host on the network to answer them — same "not activated" end state
+     as no key at all) but they do satisfy Setup silently: `WillShowUI=Never` plus a GVLK validates
+     successfully, giving a fully unattended product-key pass with no manual click. Windows 11 Home
+     (`Core`/`CoreSingleLanguage`) has no GVLK — it was never sold as a volume-licensed SKU — so this always
+     falls through to step 2 for Home.
+  2. **Placeholder key fallback** (`reference/tiny11-automated`'s pattern) when the edition is undetected or
+     has no GVLK: the placeholder key `00000-00000-00000-00000-00000` with `WillShowUI` set to `Always`.
+     Not silent — Setup shows the product-key screen once, and you click "I don't have a product key" to
+     continue. (An earlier attempt used a genuinely empty `<Key/>` with `WillShowUI` left untouched, matching
+     Rufus's approach — `reference/rufus/src/wue.c:145-151` — but this repo's actual "Setup has failed to
+     validate the product key" failures turned out to be unrelated to key formatting entirely; see the
+     install.wim mount/unmount note above. The placeholder/`Always` fallback remains for editions with no
+     GVLK, since it's a known-working pattern regardless.)
+
+  `-ProductKey` only matters if you want automatic silent activation against a real license instead of the
+  GVLK's silent-but-unactivated install.
 - `-CompressionMode None|Fast|Max|Recovery` — DISM `/Export-Image /Compress` mode for the final install.wim
   (and, under `-Core`, the install.esd conversion). **Default is `Fast`** — matches the original tiny11
   scripts' hardcoded behavior. `Max` shrinks the image further at the cost of a much slower export;
@@ -141,9 +166,8 @@ core-build-only file-level stripping (switch-gated) → load offline registry hi
 strategy → apply registry tweaks → core-build-only registry tweaks (switch-gated) → unload hives → DISM
 component cleanup + recovery-compressed export (→ ESD instead, for `-Core`) → `Update-BootImage` (bypass
 tweaks + `-Core`'s `Setup\CmdLine` key, in one boot.wim mount — no driver injection here, see above) → build
-the ISO with `oscdimg` → clean up temp files (incl. any virtio ISO this run mounted), release the
-sleep-prevention request, and eject the source ISO (skipped if this run used the source cache and never
-mounted one).
+the ISO with `oscdimg` → clean up temp files, release the sleep-prevention request, and eject the source ISO
+(skipped if this run used the source cache and never mounted one).
 
 Three arrays near the top of the script are the primary customization surface — comment out an entry to keep
 that package/task/component in the final image instead of touching the pipeline logic:
@@ -161,11 +185,14 @@ All reusable logic, dot-sourced into the caller's scope (functions read/write `$
 by `Initialize-Tiny11Session`, e.g. `$script:mountDir`, `$script:tiny11Root`, `$script:installWimPath`,
 `$script:bootWimPath`, `$script:DriveLetter`, `$script:index`, `$script:adminGroupName`, plus the newer
 `$script:architecture`, `$script:languageCode`, `$script:preparedAutounattendXml`, `$script:hostDriverPath`,
-`$script:virtioRoot`, `$script:virtioIsoMountedPath` — this is why these functions are dot-sourced rather
+`$script:virtioRoot` — this is why these functions are dot-sourced rather
 than imported as a module, and why they aren't safely callable standalone without the session having been
-initialized first). They also read the entry script's bound parameters directly by name (e.g. `$BypassMode`,
-`$Core`, `$INDEX`) via PowerShell's normal scope inheritance — the same mechanism `$ISO`/`$SCRATCH` have
-always used — so a new parameter is visible to every function without extra plumbing.
+initialized first). `$script:autounattendTemplatePath` is set earlier than the rest, by
+`Confirm-AutounattendXml` (which runs before `Initialize-Tiny11Session`) — it only needs
+`$script:BuildScratchRoot`, set at the very top of `asl-win11maker.ps1` before the pipeline starts. They also
+read the entry script's bound parameters directly by name (e.g. `$BypassMode`, `$Core`, `$INDEX`) via
+PowerShell's normal scope inheritance — the same mechanism `$ISO`/`$SCRATCH` have always used — so a new
+parameter is visible to every function without extra plumbing.
 
 **Logging convention:** `Write-Log`/`Write-Phase` use `Write-Host`, not `Write-Output` — this is deliberate.
 Several functions (`Resolve-VirtioDriverSource`, `Export-HostSystemDrivers`, etc.) `return` a value the
@@ -174,15 +201,45 @@ logging used `Write-Output`, those log lines would land in the success stream an
 return value. `Start-Transcript` still captures `Write-Host` output, so nothing is lost. Follow this same
 pattern in any new function that both logs and returns a value the caller captures.
 
+**DISM logging convention:** every DISM invocation goes through `Invoke-Dism` (a thin `dism.exe` wrapper that
+mirrors each output line into `$script:structuredLogPath`, prefixed `[DISM]`), *except* the three long-running
+calls in `Complete-InstallImage` / `Export-CoreInstallEsd` (`/Cleanup-Image /ResetBase` and the two
+`/Export-Image` calls) — those still invoke `dism.exe` directly so DISM's own progress output stays live in
+the console/transcript instead of being buffered until the process exits. `Invoke-Dism` replaced several
+call sites that previously piped to `| Out-Null` (silently discarding output) or only ever landed in a
+variable for parsing (never logged anywhere); it returns the same line-array shape as a plain `& dism ...`
+call, so existing `-split`/`Where-Object`/regex parsing on the result is unaffected.
+
+**install.wim mount/unmount must use raw `dism.exe`, not the PowerShell `Mount-WindowsImage`/
+`Dismount-WindowsImage -Save` cmdlets:** `Mount-InstallImage` and `Complete-InstallImage` use
+`dism.exe /Mount-Image` and `dism.exe /Unmount-Image /Commit` instead. This was found the hard way:
+isolation testing (bisecting driver injection, `ResetBase`, appx removal, and registry tweaks
+individually, then a completely unedited mount+save, against real installs) traced a hard "Setup has
+failed to validate the product key" failure specifically to `Dismount-WindowsImage -Save` corrupting
+install.wim's edition/licensing metadata on commit — reproducible with zero content changes, independent
+of single- vs multi-edition source WIMs. Swapping to raw `dism.exe` mount/commit resolved it. `boot.wim`
+(`Update-BootImage`) still uses the PowerShell cmdlets and that's fine — the same no-op mount+save was
+proven harmless there in the same testing, because Setup never consults boot.wim for edition/key matching,
+only install.wim. Don't "clean up" install.wim's mount/unmount back to the PowerShell cmdlets even though
+they're more idiomatic — it reintroduces this failure.
+
 Loosely grouped:
 - **Removal**: `Remove-ProvisionedAppPackages`, `Remove-Edge`, `Remove-OneDriveSetup`, `Remove-ScheduledTasks`,
   `Remove-IsoSupportFolder`; core-build-only: `Remove-SystemPackages`, `Remove-EdgeWebViewWinSxS`,
   `Remove-WindowsRecoveryEnvironment`, `Compress-WinSxS`, `Enable-DotNet35`
-- **Answer file / edition**: `Get-AnswerFileChildElement`, `ConvertTo-Tiny11AnswerFile` (injects
-  `/IMAGE/INDEX` and `UserData/AcceptEula` + `UserData/ProductKey` with `WillShowUI` forced to `Never`, so
-  Setup's product-key screen never blocks the install; embeds `-ProductKey` when given, else an empty key),
+- **Answer file / edition**: `Get-GenericVolumeLicenseKey` (Windows 11 GVLK/KMS-client-key lookup table by
+  DISM edition ID; no entry for Home/`Core`, which has no GVLK), `Get-AnswerFileChildElement`,
+  `ConvertTo-Tiny11AnswerFile` (injects `/IMAGE/INDEX` and `UserData/AcceptEula` + `UserData/ProductKey`, so
+  Setup's product-key screen never blocks the install; embeds whatever key the caller passes — real
+  `-ProductKey`, a GVLK, or nothing — with `WillShowUI` forced to `Never` when there's a real key, else the
+  tiny11-automated-style placeholder key `00000-00000-00000-00000-00000` with `WillShowUI` set to `Always`;
+  see the `-ProductKey` parameter entry above for the full precedence chain and history),
   `Add-AnswerFileBypassCommands` (Rufus-style `Unattend` bypass mode),
   `Add-AnswerFileLocalAccount` (Rufus-style `-LocalAccountName` local account, password = account name),
+  `Add-AnswerFileLocale` (embeds the mounted image's own detected UI language — `$script:languageCode` from
+  `Show-ImageMetadata` — as `InputLocale`/`SystemLocale`/`UserLocale`/`UILanguage` in the oobeSystem pass's
+  `Microsoft-Windows-International-Core` component, Rufus-style, so OOBE doesn't prompt for
+  language/region/keyboard; skipped if the image's language couldn't be detected),
   `Set-Tiny11EditionConfig` (ei.cfg/PID.txt)
 - **Driver injection**: `Add-DriversToImage` (install.wim only — DISM `Add-Driver`), `Export-HostSystemDrivers`,
   `Resolve-VirtioDriverSource`, `Add-VirtioDriversToImage` (also returns its staging dir, for
@@ -215,9 +272,9 @@ Loosely grouped:
   path and `Resolve-InstallImageIndex`'s install.wim path), `Confirm-InstallWimSource` (handles ESD→WIM
   conversion, honors `-Edition` then `-ESDINDEX`), `Copy-SourceImageFiles`, `Resolve-InstallImageIndex` (honors
   `-Edition` then `-INDEX`), `Mount-InstallImage`, `Show-ImageMetadata`, `Initialize-PreparedAnswerFile`
-  (prepares `autounattend.xml` once, injecting the image index, product-key handling (`-ProductKey`), and,
-  when `-LocalAccountName` is given, the local account, so the Sysprep copy, ISO-root copy, and Unattend
-  bypass mode never drift apart),
+  (prepares `autounattend.xml` once, injecting the image index, product-key handling (`-ProductKey`), the
+  detected image locale (`$script:languageCode`), and, when `-LocalAccountName` is given, the local account,
+  so the Sysprep copy, ISO-root copy, and Unattend bypass mode never drift apart),
   `Mount-OfflineRegistryHives` / `Dismount-OfflineRegistryHives`, `Complete-InstallImage` (calls
   `Export-CoreInstallEsd` under `-Core`), `Update-BootImage`, `New-Tiny11Iso` (names the output ISO
   `asl-win11_<tags>_<yyyyMMdd>.iso` via `Get-Tiny11IsoNameTag`, which sanitizes `$script:editionId` and
@@ -240,21 +297,34 @@ Loosely grouped:
   `-UseSourceCache` restore from here instead of touching the ISO, so `-ISO` becomes unnecessary. Never
   written to except by `Initialize-SourceImage` populating or (`-RefreshSourceCache`) replacing it; not
   touched by `Invoke-Tiny11Cleanup`.
-- `work\drivers\` (or `<SCRATCH>:\drivers\`) — staging for host-exported drivers, staged virtio drivers, and
-  a downloaded `virtio-win.iso`, when driver injection is used. Removed by `Invoke-Tiny11Cleanup` /
-  `Invoke-Tiny11EmergencyCleanup` alongside dismounting any virtio ISO this run mounted.
+- `work\drivers\` (or `<SCRATCH>:\drivers\`) — staging for host-exported drivers and staged virtio drivers,
+  when driver injection is used. Removed by `Invoke-Tiny11Cleanup` / `Invoke-Tiny11EmergencyCleanup` every
+  run.
+- `work\virtiocache\` (or `<SCRATCH>:\virtiocache\`) — only populated when `-InjectVirtioDrivers` is used: a
+  downloaded `virtio-win.iso` (under `virtiocache\download\`, skipped on reruns once cached) and/or its
+  `Expand-VirtioIso` extraction, keyed by the source `.iso`'s file name so a different virtio-win version
+  gets its own cache folder. Like `sourcecache\`, never touched by `Invoke-Tiny11Cleanup` — survives across
+  runs; delete it manually to force a re-download/re-extract.
 - `logs/` — `Start-Transcript` output per run, plus a parallel structured log (`Write-Log`)
 - `output/` — final built ISO lands here (`New-Tiny11Iso`), alongside `asl-win11-buildinfo.json`
   (`Write-BuildInfo`)
 
 ### External binaries
 - `oscdimg.exe` — used to author the final bootable ISO. Sourced from the Windows ADK if installed at the
-  standard path, otherwise downloaded from the Microsoft symbol server into the repo root and deleted again
-  during `Invoke-Tiny11Cleanup`.
-- `autounattend.xml` — unattended-setup answer file (bypasses MSA requirement on OOBE, deploys with
-  `/compact`). Auto-fetched from GitHub if not present locally; also deleted during cleanup.
+  standard path, otherwise downloaded from the Microsoft symbol server into the repo root and left there
+  (not deleted by `Invoke-Tiny11Cleanup`) so reruns reuse the download instead of re-fetching it every time.
+- `autounattend.xml` — unattended-setup answer file template (bypasses MSA requirement on OOBE, deploys with
+  `/compact`). Lives under `$script:BuildScratchRoot` (`work\autounattend.xml` or `<SCRATCH>:\autounattend.xml`),
+  not the repo root — auto-fetched from GitHub by `Confirm-AutounattendXml` if not already present there, and
+  still deleted during `Invoke-Tiny11Cleanup`. `Initialize-PreparedAnswerFile` reads this template and writes
+  the per-run, index/product-key/local-account-injected copy to `$script:tiny11Root\autounattend.xml` (already
+  a work-directory path) for the actual ISO.
 - `virtio-win.iso` — only fetched when `-InjectVirtioDrivers` is used without `-VirtioIso`; downloaded from
-  `fedorapeople.org` into the scratch `drivers\` folder, not the repo root.
+  `fedorapeople.org` into the scratch `virtiocache\download\` folder (cached across runs), not the repo root.
+- `7z.exe` (7-Zip) — used to extract virtio-win `.iso` sources instead of mounting them (`Expand-VirtioIso`).
+  Resolved from `PATH` or the standard `C:\Program Files\7-Zip\` install location; must already be installed
+  (not auto-downloaded) — install it from https://www.7-zip.org/ if missing, or pass `-VirtioIso` pointing at
+  an already-extracted driver folder to bypass it entirely.
 
 ### Reference docs
 - `docs/script-comparison.md` — the four-way (ntdevlabs / tiny11-automated / winutil / Rufus) feature

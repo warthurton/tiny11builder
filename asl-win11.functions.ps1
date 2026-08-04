@@ -55,6 +55,34 @@ function Write-Log {
     }
 }
 
+function Invoke-Dism {
+    <#
+    .SYNOPSIS
+        Runs dism.exe and mirrors every line of its output into the structured log file.
+    .DESCRIPTION
+        Several DISM calls used to throw their output away entirely via `| Out-Null`, and
+        others were only ever captured into a variable for parsing - in both cases nothing
+        ended up in a log, so a failure or an unexpected package/edition list left no trail
+        to check afterward. This wraps dism.exe, appends every output line to
+        $script:structuredLogPath (prefixed so it's easy to pick out), and returns the
+        lines unchanged so existing parsing (-split, Where-Object, regex matches, etc.)
+        keeps working exactly as before.
+        Not used for the long-running /Cleanup-Image or /Export-Image calls in
+        Complete-InstallImage / Export-CoreInstallEsd - those still run dism.exe directly so
+        DISM's own progress output stays live in the console/transcript instead of being
+        buffered until the process exits.
+    #>
+    param (
+        [Parameter(Mandatory)][string[]]$ArgumentList
+    )
+
+    $output = & dism.exe @ArgumentList
+    if ($script:structuredLogPath) {
+        $output | ForEach-Object { Add-Content -Path $script:structuredLogPath -Value "[DISM] $_" -ErrorAction SilentlyContinue }
+    }
+    return $output
+}
+
 function Get-RegistryDisplayName {
     param (
         [string]$Path,
@@ -73,20 +101,6 @@ function Get-RegistryDisplayName {
     }
 
     return $tail
-}
-
-function Invoke-WithoutProgress {
-    param (
-        [scriptblock]$ScriptBlock
-    )
-
-    $previousProgressPreference = $global:ProgressPreference
-    try {
-        $global:ProgressPreference = 'SilentlyContinue'
-        & $ScriptBlock
-    } finally {
-        $global:ProgressPreference = $previousProgressPreference
-    }
 }
 
 function Set-RegistryValue {
@@ -137,7 +151,7 @@ function Remove-ProvisionedAppPackages {
         [string[]]$PackagePrefixes
     )
     Write-Phase 'Remove provisioned app packages'
-    $packages = & 'dism' '/English' "/image:$ImagePath" '/Get-ProvisionedAppxPackages' |
+    $packages = Invoke-Dism -ArgumentList @('/English', "/image:$ImagePath", '/Get-ProvisionedAppxPackages') |
         ForEach-Object {
             if ($_ -match 'PackageName : (.*)') { $matches[1] }
         }
@@ -153,7 +167,7 @@ function Remove-ProvisionedAppPackages {
 
     foreach ($package in $packagesToRemove) {
         Write-Output "  Removing: $package"
-        & 'dism' '/English' "/image:$ImagePath" '/Remove-ProvisionedAppxPackage' "/PackageName:$package"
+        Invoke-Dism -ArgumentList @('/English', "/image:$ImagePath", '/Remove-ProvisionedAppxPackage', "/PackageName:$package") | Out-Null
     }
     Write-Output "Removed $($packagesToRemove.Count) provisioned package(s)."
 }
@@ -301,7 +315,7 @@ function Remove-SystemPackages {
         )
     }
 
-    $allPackages = & dism /image:$MountDir /Get-Packages /Format:Table
+    $allPackages = Invoke-Dism -ArgumentList @("/image:$MountDir", '/Get-Packages', '/Format:Table')
     $allPackages = $allPackages -split "`n" | Select-Object -Skip 1
 
     $removedCount = 0
@@ -310,7 +324,7 @@ function Remove-SystemPackages {
         foreach ($package in $packagesToRemove) {
             $packageIdentity = ($package -split '\s+')[0]
             Write-Output "  Removing: $packageIdentity"
-            & dism /image:$MountDir /Remove-Package /PackageName:$packageIdentity | Out-Null
+            Invoke-Dism -ArgumentList @("/image:$MountDir", '/Remove-Package', "/PackageName:$packageIdentity") | Out-Null
             $removedCount += 1
         }
     }
@@ -330,7 +344,7 @@ function Enable-DotNet35 {
         [string]$SourceRoot
     )
     Write-Phase 'Enable .NET Framework 3.5'
-    & 'dism' "/image:$MountDir" '/enable-feature' '/featurename:NetFX3' '/All' "/source:$SourceRoot\sources\sxs" '/LimitAccess'
+    Invoke-Dism -ArgumentList @("/image:$MountDir", '/enable-feature', '/featurename:NetFX3', '/All', "/source:$SourceRoot\sources\sxs", '/LimitAccess') | Out-Null
     Write-Output '  .NET Framework 3.5 enabled.'
 }
 
@@ -531,6 +545,48 @@ function Compress-WinSxS {
 
 #---------[ Answer File & Edition Enforcement Functions ]---------#
 
+function Get-GenericVolumeLicenseKey {
+    <#
+    .SYNOPSIS
+        Looks up the Windows 11 Generic Volume License Key (GVLK / KMS client setup key) for a
+        DISM edition ID, e.g. "Professional" -> W269N-WFGWX-YVC9B-4J6C9-T83GX.
+    .DESCRIPTION
+        GVLKs are real, Microsoft-published per-edition keys (see
+        https://learn.microsoft.com/windows-server/get-started/kms-client-activation-keys),
+        published specifically so a generic multi-edition ISO's Setup can select an edition and
+        pass product-key validation without a real retail license. They do NOT activate Windows
+        on their own - there's no KMS host on the network to answer them - so the installed
+        system ends up "not activated", the same end state as installing with no key at all.
+        What they buy is a fully silent Setup: WillShowUI=Never plus a GVLK validates
+        successfully, whereas WillShowUI=Never plus a blank/placeholder key hard-fails (see
+        ConvertTo-Tiny11AnswerFile), and the placeholder+WillShowUI=Always fallback needs one
+        manual "I don't have a product key" click. Used by Initialize-PreparedAnswerFile as the
+        default -ProductKey substitute whenever the detected edition has a known GVLK.
+
+        Windows 11 Home ("Core"/"CoreSingleLanguage") deliberately has no entry - Home was never
+        sold as a volume-licensed SKU, so Microsoft doesn't publish a GVLK for it; callers must
+        fall back to the placeholder-key/WillShowUI=Always path for that edition.
+    #>
+    param (
+        [string]$EditionId
+    )
+
+    $gvlkMap = @{
+        'Professional'             = 'W269N-WFGWX-YVC9B-4J6C9-T83GX'
+        'ProfessionalN'            = 'MH37W-N47XK-V7XM9-C7227-GCQG9'
+        'ProfessionalWorkstation'  = 'NRG8B-VKK3Q-CXVCJ-9G2XF-6Q84J'
+        'ProfessionalWorkstationN' = '9FNHH-K3HBT-3W4TD-6383H-6XYWF'
+        'ProfessionalEducation'    = '6TP4R-GNPTD-KYYHQ-7B7DP-J447Y'
+        'ProfessionalEducationN'   = 'YVWGF-BXNMC-HTQYQ-CPQ99-66QFC'
+        'Education'                = 'NW6C2-QMPVW-D7KKK-3GKT6-VCFB2'
+        'EducationN'               = '2WH4N-8QGBV-H22JP-CT43Q-MDWWJ'
+        'Enterprise'               = 'NPPR9-FWDCX-D2C8J-H872K-2YT43'
+        'EnterpriseN'              = 'DPH2V-TTNVB-4X9Q3-TJR4H-KHJW4'
+    }
+
+    return $gvlkMap[$EditionId]
+}
+
 function Get-AnswerFileChildElement {
     <#
     .SYNOPSIS
@@ -565,15 +621,19 @@ function ConvertTo-Tiny11AnswerFile {
         Resolve-InstallImageIndex, instead of relying on the answer file's own (possibly
         stale) assumptions.
 
-        Also ensures UserData/AcceptEula and UserData/ProductKey/WillShowUI are present, so
-        Setup never blocks on the "Enter your product key" screen (and aborts if that screen
-        is Cancelled). Windows Setup shows that screen whenever the ProductKey element is
-        entirely absent, even though an empty <Key/> is perfectly acceptable to it — Rufus
-        hits the same requirement (reference/rufus/src/wue.c:145-151: "WinPE will complain if
-        we don't provide a product key. *Any* product key."). Setting WillShowUI to Never
-        additionally guarantees the screen stays suppressed even if the key turns out to be
-        invalid. When -ProductKey is supplied, its value is embedded instead of an empty key,
-        letting Setup activate automatically against a real license.
+        Also ensures UserData/AcceptEula is present and UserData/ProductKey/Key exists, so
+        Setup never blocks on the "Enter your product key" screen being entirely absent (Rufus
+        hits the same requirement — reference/rufus/src/wue.c:145-151: "WinPE will complain if
+        we don't provide a product key. *Any* product key."). When -ProductKey supplies a real
+        key, it's embedded with WillShowUI forced to 'Never' so Setup validates and
+        auto-activates against it silently. Without a real key, a genuinely empty <Key/> plus
+        no WillShowUI (Rufus's own approach) turned out to still trip a hard "Setup has failed
+        to validate the product key" failure in practice on at least one real install, so this
+        falls back to tiny11-automated's pattern instead (reference/tiny11-automated's
+        Schneegans-generated template): the placeholder key '00000-00000-00000-00000-00000'
+        with WillShowUI set to 'Always'. That trades full silence for reliability — Setup shows
+        the product-key screen once, where clicking "I don't have a product key" continues the
+        install — rather than a hard failure with no way to proceed.
     #>
     param (
         [Parameter(Mandatory)][string]$XmlContent,
@@ -627,14 +687,16 @@ function ConvertTo-Tiny11AnswerFile {
 
     $productKeyElement = Get-AnswerFileChildElement -Parent $userData -Name 'ProductKey' -NamespaceUri $unattendNs
 
+    $placeholderProductKey = '00000-00000-00000-00000-00000'
     $productKeyValue = if ($ProductKey) { $ProductKey.Trim() } else { '' }
-    if ($productKeyValue -eq '00000-00000-00000-00000-00000') { $productKeyValue = '' }
+    if ($productKeyValue -eq $placeholderProductKey) { $productKeyValue = '' }
+    $hasRealProductKey = [bool]$productKeyValue
 
     $productKeyKeyElement = Get-AnswerFileChildElement -Parent $productKeyElement -Name 'Key' -NamespaceUri $unattendNs
-    $productKeyKeyElement.InnerText = $productKeyValue
+    $productKeyKeyElement.InnerText = if ($hasRealProductKey) { $productKeyValue } else { $placeholderProductKey }
 
     $willShowUiElement = Get-AnswerFileChildElement -Parent $productKeyElement -Name 'WillShowUI' -NamespaceUri $unattendNs
-    $willShowUiElement.InnerText = 'Never'
+    $willShowUiElement.InnerText = if ($hasRealProductKey) { 'Never' } else { 'Always' }
 
     $imageInstall = Get-AnswerFileChildElement -Parent $setupComponent -Name 'ImageInstall' -NamespaceUri $unattendNs
     $osImage = Get-AnswerFileChildElement -Parent $imageInstall -Name 'OSImage' -NamespaceUri $unattendNs
@@ -860,6 +922,65 @@ function Add-AnswerFileLocalAccount {
     return $xmlDoc.OuterXml
 }
 
+function Add-AnswerFileLocale {
+    <#
+    .SYNOPSIS
+        Embeds locale/keyboard settings into autounattend.xml so OOBE doesn't ask.
+    .DESCRIPTION
+        Rufus-style regional-options block (reference/rufus/src/wue.c:462-478): adds an
+        oobeSystem-pass <component name="Microsoft-Windows-International-Core"> setting
+        InputLocale/SystemLocale/UserLocale/UILanguage. Rufus sources these from the host
+        machine running Rufus; this repo already detects the mounted image's own default UI
+        language via DISM in Show-ImageMetadata ($script:languageCode, e.g. "en-US"), which is
+        the more correct source here since the builder machine's locale has no bearing on the
+        image being built. Without this block Setup has no locale answer for the oobeSystem
+        pass and falls back to asking interactively. Skipped entirely if the image's language
+        couldn't be detected, rather than guessing.
+    #>
+    param (
+        [Parameter(Mandatory)][string]$XmlContent,
+        [Parameter(Mandatory)][string]$LanguageCode
+    )
+
+    $unattendNs = 'urn:schemas-microsoft-com:unattend'
+
+    $xmlDoc = [xml]::new()
+    $xmlDoc.PreserveWhitespace = $true
+    $xmlDoc.LoadXml($XmlContent)
+
+    if ($xmlDoc.DocumentElement.NamespaceURI -ne $unattendNs) {
+        throw "Unexpected autounattend.xml namespace: $($xmlDoc.DocumentElement.NamespaceURI)"
+    }
+
+    $nsMgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+    $nsMgr.AddNamespace('u', $unattendNs)
+
+    $oobeSettings = $xmlDoc.SelectSingleNode('/u:unattend/u:settings[@pass="oobeSystem"]', $nsMgr)
+    if (-not $oobeSettings) {
+        $oobeSettings = $xmlDoc.CreateElement('settings', $unattendNs)
+        $oobeSettings.SetAttribute('pass', 'oobeSystem')
+        [void]$xmlDoc.DocumentElement.AppendChild($oobeSettings)
+    }
+
+    $intlComponent = $oobeSettings.SelectSingleNode('u:component[@name="Microsoft-Windows-International-Core"]', $nsMgr)
+    if (-not $intlComponent) {
+        $intlComponent = $xmlDoc.CreateElement('component', $unattendNs)
+        $intlComponent.SetAttribute('name', 'Microsoft-Windows-International-Core')
+        $intlComponent.SetAttribute('processorArchitecture', 'amd64')
+        $intlComponent.SetAttribute('publicKeyToken', '31bf3856ad364e35')
+        $intlComponent.SetAttribute('language', 'neutral')
+        $intlComponent.SetAttribute('versionScope', 'nonSxS')
+        [void]$oobeSettings.PrependChild($intlComponent)
+    }
+
+    foreach ($elementName in @('InputLocale', 'SystemLocale', 'UserLocale', 'UILanguage')) {
+        $element = Get-AnswerFileChildElement -Parent $intlComponent -Name $elementName -NamespaceUri $unattendNs
+        $element.InnerText = $LanguageCode
+    }
+
+    return $xmlDoc.OuterXml
+}
+
 function Set-Tiny11EditionConfig {
     <#
     .SYNOPSIS
@@ -924,7 +1045,7 @@ function Add-DriversToImage {
         [string]$Label
     )
     Write-Host "  Injecting drivers into $Label from $DriverPath..."
-    & 'dism' '/English' "/image:$MountPath" '/Add-Driver' "/Driver:$DriverPath" '/Recurse' | Out-Null
+    Invoke-Dism -ArgumentList @('/English', "/image:$MountPath", '/Add-Driver', "/Driver:$DriverPath", '/Recurse') | Out-Null
     Write-Host "  Driver injection into $Label complete."
 }
 
@@ -946,27 +1067,89 @@ function Export-HostSystemDrivers {
     return $destination
 }
 
+function Resolve-SevenZipPath {
+    <#
+    .SYNOPSIS
+        Locates 7z.exe, used to extract virtio-win.iso instead of mounting it.
+    #>
+    $command = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+
+    $candidates = @(
+        "$Env:ProgramFiles\7-Zip\7z.exe",
+        "${Env:ProgramFiles(x86)}\7-Zip\7z.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    throw "7-Zip (7z.exe) was not found on PATH or in the standard install location. Install 7-Zip " +
+        "(https://www.7-zip.org/) or pass -VirtioIso pointing at an already-extracted driver folder instead."
+}
+
+function Expand-VirtioIso {
+    <#
+    .SYNOPSIS
+        Extracts a virtio-win .iso into a cached folder via 7-Zip instead of mounting it.
+    .DESCRIPTION
+        Cached under <SCRATCH>\virtiocache\<iso base name>\, keyed by the ISO's own file
+        name so a different virtio-win version naturally gets its own cache folder instead
+        of silently reusing a stale extraction. Unlike work\drivers\, this directory is
+        never touched by Invoke-Tiny11Cleanup / Invoke-Tiny11EmergencyCleanup - like
+        sourcecache\, it survives across runs; delete it manually to force a re-extract.
+
+        Mounting the ISO (the old approach) required Mount-DiskImage/Dismount-DiskImage and
+        tracking $script:virtioIsoMountedPath so a crashed run didn't leave the driver ISO
+        mounted. Extracting to a persistent cache avoids that lifecycle entirely and means
+        reruns with the same -VirtioIso skip the extraction step too.
+    #>
+    param ([Parameter(Mandatory)][string]$IsoPath)
+
+    $cacheKey = [System.IO.Path]::GetFileNameWithoutExtension($IsoPath)
+    $extractDir = Join-Path $script:BuildScratchRoot "virtiocache\$cacheKey"
+
+    $alreadyExtracted = (Test-Path -LiteralPath $extractDir) -and
+        (Get-ChildItem -Path $extractDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($alreadyExtracted) {
+        Write-Host "  Reusing cached virtio-win extraction at $extractDir"
+        return $extractDir
+    }
+
+    if (Test-Path -LiteralPath $extractDir) {
+        Remove-Item -Path $extractDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+    $sevenZip = Resolve-SevenZipPath
+    Write-Host "  Extracting virtio-win.iso to $extractDir..."
+    & $sevenZip 'x' $IsoPath "-o$extractDir" '-y' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "7-Zip failed to extract '$IsoPath' (exit code $LASTEXITCODE)."
+    }
+
+    return $extractDir
+}
+
 function Resolve-VirtioDriverSource {
     <#
     .SYNOPSIS
         Resolves the virtio-win driver root, downloading the stable ISO if none was given.
     .DESCRIPTION
         -VirtioIso may be a drive letter (already-mounted ISO), a path to an .iso file
-        (mounted here via Mount-DiskImage), or an already-extracted folder. When omitted,
-        downloads the latest stable virtio-win.iso into the build scratch root and mounts
-        that instead.
-        Sets $script:virtioIsoMountedPath to the .iso path whenever this function did the
-        mounting (whether downloaded or a local .iso file), so cleanup can dismount it.
-        Left unset when the caller passed an already-mounted drive letter or an extracted
-        folder, since nothing was mounted here to undo.
+        (extracted here via Expand-VirtioIso rather than mounted), or an already-extracted
+        folder. When omitted, first looks for an already-extracted virtio-win cache folder
+        under <SCRATCH>\virtiocache\ (any prior Expand-VirtioIso output, keyed by ISO file
+        name) and reuses the most recently written one if found - no network access at all.
+        Only when no such cache exists does it download the latest stable virtio-win.iso -
+        cached under <SCRATCH>\virtiocache\download\ so reruns skip the download - and
+        extract that.
 
-        The downloaded file is size-sanity-checked before mounting: fedorapeople.org (the
+        The downloaded file is size-sanity-checked before extraction: fedorapeople.org (the
         upstream virtio-win host) sits behind an "Anubis" JavaScript proof-of-work anti-bot
         gate that serves a small HTML challenge page (with a 200 status) to non-browser
         HTTP clients instead of the real ISO. Without this check, that HTML page gets
-        written to virtio-win.iso and only fails much later, cryptically, at
-        Mount-DiskImage ("The file or directory is corrupted and unreadable"). If the
-        auto-download keeps failing this check, download virtio-win.iso manually in a
+        written to virtio-win.iso and only fails much later, cryptically, at extraction. If
+        the auto-download keeps failing this check, download virtio-win.iso manually in a
         browser (which can pass the JS challenge) and pass it via -VirtioIso instead.
     #>
     param (
@@ -990,31 +1173,45 @@ function Resolve-VirtioDriverSource {
         $isoPath = $VirtioIso
         Write-Host "  Using local virtio ISO: $isoPath"
     } else {
-        Write-Host '  No -VirtioIso given; downloading the latest stable virtio-win.iso...'
-        $downloadDir = Join-Path $script:BuildScratchRoot 'drivers\virtio-download'
+        $virtioCacheRoot = Join-Path $script:BuildScratchRoot 'virtiocache'
+        $cachedExtraction = Get-ChildItem -Path $virtioCacheRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'download' } |
+            Where-Object { Get-ChildItem -Path $_.FullName -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1 } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($cachedExtraction) {
+            Write-Host "  No -VirtioIso given; reusing most recent cached extraction at $($cachedExtraction.FullName)."
+            return $cachedExtraction.FullName
+        }
+
+        $downloadDir = Join-Path $script:BuildScratchRoot 'virtiocache\download'
         New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
         $isoPath = Join-Path $downloadDir 'virtio-win.iso'
-        $downloadUrl = 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso'
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $isoPath -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
-
         $minimumExpectedBytes = 100MB
-        $downloadedSize = (Get-Item $isoPath).Length
-        if ($downloadedSize -lt $minimumExpectedBytes) {
-            $preview = (Get-Content -Path $isoPath -TotalCount 1 -ErrorAction SilentlyContinue)
-            Remove-Item -Path $isoPath -Force -ErrorAction SilentlyContinue
-            throw "Downloaded virtio-win.iso is only $downloadedSize bytes (expected several hundred MB) - " +
-                "this is almost certainly an anti-bot challenge page from $downloadUrl, not the real ISO " +
-                "(first line of response: '$preview'). Download virtio-win.iso manually in a browser and " +
-                "pass it via -VirtioIso instead."
+
+        $cachedDownloadValid = (Test-Path -LiteralPath $isoPath) -and
+            (Get-Item -LiteralPath $isoPath).Length -ge $minimumExpectedBytes
+        if ($cachedDownloadValid) {
+            Write-Host "  Reusing cached download at $isoPath."
+        } else {
+            Write-Host '  No -VirtioIso given; downloading the latest stable virtio-win.iso...'
+            $downloadUrl = 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso'
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $isoPath -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+
+            $downloadedSize = (Get-Item $isoPath).Length
+            if ($downloadedSize -lt $minimumExpectedBytes) {
+                $preview = (Get-Content -Path $isoPath -TotalCount 1 -ErrorAction SilentlyContinue)
+                Remove-Item -Path $isoPath -Force -ErrorAction SilentlyContinue
+                throw "Downloaded virtio-win.iso is only $downloadedSize bytes (expected several hundred MB) - " +
+                    "this is almost certainly an anti-bot challenge page from $downloadUrl, not the real ISO " +
+                    "(first line of response: '$preview'). Download virtio-win.iso manually in a browser and " +
+                    "pass it via -VirtioIso instead."
+            }
+            Write-Host "  Downloaded virtio-win.iso to $isoPath ($downloadedSize bytes)."
         }
-        Write-Host "  Downloaded virtio-win.iso to $isoPath ($downloadedSize bytes)."
     }
 
-    $mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
-    $driveLetter = ($mountResult | Get-Volume).DriveLetter + ':'
-    $script:virtioIsoMountedPath = $isoPath
-    Write-Host "  Mounted virtio-win.iso at $driveLetter"
-    return $driveLetter
+    return Expand-VirtioIso -IsoPath $isoPath
 }
 
 function Add-VirtioDriversToImage {
@@ -1691,10 +1888,10 @@ function Invoke-Tiny11EmergencyCleanup {
         Best-effort recovery from a mid-pipeline failure.
     .DESCRIPTION
         Discards any images left mounted (install.wim or boot.wim) and unloads offline
-        registry hives so a failed run doesn't block the next one. Also dismounts any
-        virtio driver ISO this run mounted and removes staged driver folders. Called from
-        the top-level catch block in asl-win11maker.ps1 — every step here is best-effort
-        and swallows its own errors since we're already in a failure path.
+        registry hives so a failed run doesn't block the next one. Also removes staged
+        driver folders. Called from the top-level catch block in asl-win11maker.ps1 — every
+        step here is best-effort and swallows its own errors since we're already in a
+        failure path.
     #>
     Write-Log 'Running emergency cleanup after failure...' 'WARN'
 
@@ -1716,11 +1913,6 @@ function Invoke-Tiny11EmergencyCleanup {
             Dismount-DiskImage -ImagePath $script:sourceIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
         } catch {}
     }
-    if ($script:virtioIsoMountedPath) {
-        try {
-            Dismount-DiskImage -ImagePath $script:virtioIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
-        } catch {}
-    }
     if ($script:BuildScratchRoot) {
         $driversRoot = Join-Path $script:BuildScratchRoot 'drivers'
         if (Test-Path $driversRoot) {
@@ -1732,8 +1924,19 @@ function Invoke-Tiny11EmergencyCleanup {
 }
 
 function Confirm-AutounattendXml {
-    if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
-        Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml"
+    <#
+    .SYNOPSIS
+        Ensures the autounattend.xml template is present, downloading it if not.
+    .DESCRIPTION
+        Lives under $script:BuildScratchRoot rather than $PSScriptRoot so a downloaded
+        template never sits alongside the repo's own script files. Sets
+        $script:autounattendTemplatePath so Initialize-PreparedAnswerFile and
+        Invoke-Tiny11Cleanup both target the same location.
+    #>
+    New-Item -ItemType Directory -Force -Path $script:BuildScratchRoot | Out-Null
+    $script:autounattendTemplatePath = Join-Path $script:BuildScratchRoot 'autounattend.xml'
+    if (-not (Test-Path -LiteralPath $script:autounattendTemplatePath)) {
+        Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile $script:autounattendTemplatePath
     }
 }
 
@@ -1858,7 +2061,7 @@ function Resolve-EditionImageIndex {
 
     $images = Get-WindowsImage -ImagePath $ImagePath
     $matchedImages = foreach ($image in $images) {
-        $wimInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$ImagePath" "/index:$($image.ImageIndex)"
+        $wimInfo = Invoke-Dism -ArgumentList @('/English', '/Get-WimInfo', "/wimFile:$ImagePath", "/index:$($image.ImageIndex)")
         $editionId = Get-DismInfoField -Lines ($wimInfo -split '\r?\n') -FieldName 'Edition ID'
         if ($image.ImageName -like "*$Edition*" -or $editionId -like "*$Edition*") {
             [PSCustomObject]@{ Index = $image.ImageIndex; Name = $image.ImageName; EditionId = $editionId }
@@ -2013,6 +2216,16 @@ function Resolve-InstallImageIndex {
 }
 
 function Mount-InstallImage {
+    <#
+    .SYNOPSIS
+        Mounts install.wim at the selected index for editing.
+    .DESCRIPTION
+        Mounts via raw `dism.exe /Mount-Image`, not the `Mount-WindowsImage` PowerShell
+        cmdlet - paired with Complete-InstallImage's `dism.exe /Unmount-Image /Commit`. See
+        Complete-InstallImage's description for why: the PowerShell mount/dismount-save cmdlet
+        pair was isolated as the cause of a hard "Setup has failed to validate the product key"
+        failure, independent of any actual edit made while mounted.
+    #>
     Write-Phase 'Mount install image'
     Write-Output '  Mounting Windows image. This may take a while.'
     & takeown "/F" $script:installWimPath
@@ -2023,12 +2236,15 @@ function Mount-InstallImage {
         Write-Error "$script:installWimPath not found"
     }
     New-Item -ItemType Directory -Force -Path $script:mountDir > $null
-    Invoke-WithoutProgress { Mount-WindowsImage -ImagePath $script:installWimPath -Index $script:index -Path $script:mountDir }
+    dism.exe /Mount-Image /ImageFile:$script:installWimPath /Index:$script:index /MountDir:$script:mountDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "DISM /Mount-Image of install.wim failed (exit code $LASTEXITCODE) - see C:\Windows\Logs\DISM\dism.log."
+    }
 }
 
 function Show-ImageMetadata {
     Write-Phase 'Inspect selected image metadata'
-    $imageIntl = & dism /English /Get-Intl "/Image:$script:mountDir"
+    $imageIntl = Invoke-Dism -ArgumentList @('/English', '/Get-Intl', "/Image:$script:mountDir")
     $languageLine = $imageIntl -split '\n' | Where-Object { $_ -match 'Default system UI language : ([a-zA-Z]{2}-[a-zA-Z]{2})' }
 
     if ($languageLine) {
@@ -2039,7 +2255,7 @@ function Show-ImageMetadata {
         Write-Output "Default system UI language code not found."
     }
 
-    $imageInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$script:installWimPath" "/index:$script:index"
+    $imageInfo = Invoke-Dism -ArgumentList @('/English', '/Get-WimInfo', "/wimFile:$script:installWimPath", "/index:$script:index")
     $lines = $imageInfo -split '\r?\n'
 
     foreach ($line in $lines) {
@@ -2059,7 +2275,20 @@ function Show-ImageMetadata {
 
     # Build/edition metadata for Write-BuildInfo and the ei.cfg edition-enforcement step.
     $script:detectedImageName = Get-DismInfoField -Lines $lines -FieldName 'Name'
-    $script:editionId = Get-DismInfoField -Lines $lines -FieldName 'Edition ID'
+
+    # /Get-WimInfo never exposes an "Edition ID" field (despite the similarly-named "Edition ID"
+    # DISM uses elsewhere, e.g. ei.cfg) - /Get-CurrentEdition against the now-mounted image is
+    # the actual source for it, returning the DISM edition ID token (e.g. "Professional", "Core"
+    # for Home, "Education") in a single "Current Edition : <id>" line.
+    $currentEditionOutput = Invoke-Dism -ArgumentList @('/English', "/Image:$script:mountDir", '/Get-CurrentEdition')
+    $editionLine = $currentEditionOutput | Where-Object { $_ -match '^\s*Current Edition\s*:\s*(.+?)\s*$' }
+
+    if ($editionLine) {
+        $script:editionId = $Matches[1]
+    } else {
+        $script:editionId = ''
+    }
+
     $versionField = Get-DismInfoField -Lines $lines -FieldName 'Version'
     $serviceBuildField = Get-DismInfoField -Lines $lines -FieldName 'ServicePack Build'
     $script:detectedFullVersion = if ($serviceBuildField) { "$versionField.$serviceBuildField" } else { $versionField }
@@ -2100,21 +2329,49 @@ function Initialize-PreparedAnswerFile {
     .SYNOPSIS
         Prepares autounattend.xml once, so every consumer sees the same content.
     .DESCRIPTION
-        Injects the selected image index, product-key handling (-ProductKey, defaulting to
-        an empty key so Setup never blocks on the product-key screen), and (when
+        Injects the selected image index, product-key handling, the mounted image's own locale
+        (from $script:languageCode, so OOBE doesn't ask for language/region/keyboard), and (when
         -LocalAccountName is given) a local account, caching the result in
         $script:preparedAutounattendXml. Enable-LocalAccountOOBE (Sysprep copy),
         Invoke-HardwareBypassStrategy's Unattend mode, and New-Tiny11Iso (ISO root copy) all
         read this same cached value instead of each recomputing their own copy, which
         previously let the Sysprep and ISO-root copies drift apart.
+
+        Product-key precedence: an explicit -ProductKey always wins. Otherwise, falls back to
+        the detected edition's Generic Volume License Key (Get-GenericVolumeLicenseKey) when one
+        exists, so Setup gets a fully silent, WillShowUI=Never product-key pass instead of
+        ConvertTo-Tiny11AnswerFile's placeholder-key/WillShowUI=Always screen. The GVLK doesn't
+        activate Windows (same "not activated" end state either way) - it only lets Setup's
+        validation pass silently. Editions with no published GVLK (Home/"Core" chief among them
+        - never sold as a volume-licensed SKU) or an undetected edition fall through to the
+        placeholder/Always screen unchanged.
     #>
     Write-Phase 'Prepare autounattend.xml'
-    $script:preparedAutounattendXml = Get-Content -Path "$PSScriptRoot\autounattend.xml" -Raw
+    $script:preparedAutounattendXml = Get-Content -Path $script:autounattendTemplatePath -Raw
+
+    $effectiveProductKey = $ProductKey
+    if (-not $effectiveProductKey -and $script:editionId) {
+        $genericKey = Get-GenericVolumeLicenseKey -EditionId $script:editionId
+        if ($genericKey) {
+            $effectiveProductKey = $genericKey
+            Write-Output "  No -ProductKey given; using the Generic Volume License Key for edition '$script:editionId' so Setup passes silently (Windows will still show as not activated - see CLAUDE.md)."
+        }
+    }
+
     try {
-        $script:preparedAutounattendXml = ConvertTo-Tiny11AnswerFile -XmlContent $script:preparedAutounattendXml -ImageIndex $script:index -ProductKey $ProductKey
+        $script:preparedAutounattendXml = ConvertTo-Tiny11AnswerFile -XmlContent $script:preparedAutounattendXml -ImageIndex $script:index -ProductKey $effectiveProductKey
         Write-Output "  Injected image index $script:index into autounattend.xml."
     } catch {
         Write-Log "Could not inject image index into autounattend.xml: $_" 'WARN'
+    }
+
+    if ($script:languageCode) {
+        try {
+            $script:preparedAutounattendXml = Add-AnswerFileLocale -XmlContent $script:preparedAutounattendXml -LanguageCode $script:languageCode
+            Write-Output "  Embedded locale '$script:languageCode' into autounattend.xml."
+        } catch {
+            Write-Log "Could not embed locale into autounattend.xml: $_" 'WARN'
+        }
     }
 
     if ($LocalAccountName) {
@@ -2146,17 +2403,38 @@ function Dismount-OfflineRegistryHives {
 }
 
 function Complete-InstallImage {
+    <#
+    .SYNOPSIS
+        Cleans up, commits, and single-index-exports the mounted install.wim.
+    .DESCRIPTION
+        Unmounts via raw `dism.exe /Unmount-Image /Commit`, not the `Dismount-WindowsImage
+        -Save` PowerShell cmdlet. Isolation testing (bisecting driver injection, ResetBase,
+        appx removal, registry tweaks, and finally a completely unedited mount+save, each
+        individually, against a real install) traced a hard "Setup has failed to validate the
+        product key" failure specifically to `Dismount-WindowsImage -Save` corrupting
+        install.wim's edition/licensing metadata on commit - reproducible even with zero
+        content changes, and independent of single- vs multi-edition source WIMs. The same
+        no-op mount+save on boot.wim (Update-BootImage) was proven harmless in the same testing,
+        because Setup never consults boot.wim for edition/key matching - only install.wim.
+        Swapping to `dism.exe /Mount-Image` + `/Unmount-Image /Commit` (still used for
+        Mount-InstallImage and here) resolved it. Keep both of install.wim's mount/unmount
+        calls on the raw dism.exe path; don't revert to the PowerShell cmdlets here even though
+        they're more idiomatic.
+    #>
     Write-Phase 'Finalize install image'
     Write-Output '  Cleaning up component store...'
     dism.exe /Image:$script:mountDir /Cleanup-Image /StartComponentCleanup /ResetBase
     Write-Output '  Component cleanup complete.'
     Write-Output '  Saving and unmounting install image...'
-    Invoke-WithoutProgress { Dismount-WindowsImage -Path $script:mountDir -Save }
+    dism.exe /Unmount-Image /MountDir:$script:mountDir /Commit
+    if ($LASTEXITCODE -ne 0) {
+        throw "DISM /Unmount-Image /Commit of install.wim failed (exit code $LASTEXITCODE) - see C:\Windows\Logs\DISM\dism.log."
+    }
 
     Write-Output "  Exporting optimized install image (Compress:$($CompressionMode.ToLower()))..."
     $exportDestination = "$script:tiny11Root\sources\install2.wim"
     Remove-Item -Path $exportDestination -Force -ErrorAction SilentlyContinue
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower()) }
+    Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower())
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exportDestination) -or (Get-Item -LiteralPath $exportDestination).Length -lt 1MB) {
         throw "DISM /Export-Image of install.wim failed (exit code $LASTEXITCODE) or produced a suspiciously small file - see C:\Windows\Logs\DISM\dism.log. Leaving the original install.wim in place."
     }
@@ -2181,7 +2459,7 @@ function Export-CoreInstallEsd {
     Write-Output "  Exporting install.esd (Compress:$($CompressionMode.ToLower()))..."
     $exportDestination = "$script:tiny11Root\sources\install.esd"
     Remove-Item -Path $exportDestination -Force -ErrorAction SilentlyContinue
-    Invoke-WithoutProgress { Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower()) }
+    Dism.exe /Export-Image /SourceImageFile:"$script:installWimPath" /SourceIndex:$script:index /DestinationImageFile:"$exportDestination" /Compress:$($CompressionMode.ToLower())
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exportDestination) -or (Get-Item -LiteralPath $exportDestination).Length -lt 1MB) {
         throw "DISM /Export-Image of install.esd failed (exit code $LASTEXITCODE) or produced a suspiciously small file - see C:\Windows\Logs\DISM\dism.log. Leaving the original install.wim in place."
     }
@@ -2211,7 +2489,7 @@ function Update-BootImage {
     & takeown "/F" $script:bootWimPath | Out-Null
     & icacls $script:bootWimPath "/grant" "$($script:adminGroupName):(F)"
     Set-ItemProperty -Path $script:bootWimPath -Name IsReadOnly -Value $false
-    Invoke-WithoutProgress { Mount-WindowsImage -ImagePath $script:bootWimPath -Index 2 -Path $script:mountDir }
+    Mount-WindowsImage -ImagePath $script:bootWimPath -Index 2 -Path $script:mountDir
 
     Write-Output '  Loading boot image registry hives...'
     reg load HKLM\zCOMPONENTS $script:mountDir\Windows\System32\config\COMPONENTS
@@ -2234,7 +2512,7 @@ function Update-BootImage {
     Dismount-OfflineRegistryHives
 
     Write-Output '  Saving and unmounting boot image...'
-    Invoke-WithoutProgress { Dismount-WindowsImage -Path $script:mountDir -Save }
+    Dismount-WindowsImage -Path $script:mountDir -Save
     Clear-Host
 }
 
@@ -2352,14 +2630,6 @@ function Invoke-Tiny11Cleanup {
     Remove-Item -Path $script:tiny11Root -Recurse -Force | Out-Null
     Remove-Item -Path $script:mountDir -Recurse -Force | Out-Null
 
-    if ($script:virtioIsoMountedPath) {
-        Write-Output "Dismounting virtio driver ISO..."
-        try {
-            Dismount-DiskImage -ImagePath $script:virtioIsoMountedPath -ErrorAction SilentlyContinue | Out-Null
-        } catch {
-            Write-Output "Could not dismount virtio driver ISO: $_"
-        }
-    }
     $driversRoot = Join-Path $script:BuildScratchRoot 'drivers'
     if (Test-Path $driversRoot) {
         Remove-Item -Path $driversRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -2378,10 +2648,8 @@ function Invoke-Tiny11Cleanup {
         Get-Volume -DriveLetter $script:DriveLetter[0] | Get-DiskImage | Dismount-DiskImage
         Write-Output "Iso drive ejected"
     }
-    Write-Output "Removing oscdimg.exe..."
-    Remove-Item -Path "$PSScriptRoot\oscdimg.exe" -Force -ErrorAction SilentlyContinue
     Write-Output "Removing autounattend.xml..."
-    Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $script:autounattendTemplatePath -Force -ErrorAction SilentlyContinue
 
     Write-Output "Cleanup check :"
     if (Test-Path -Path $script:tiny11Root) {
@@ -2406,21 +2674,10 @@ function Invoke-Tiny11Cleanup {
     } else {
         Write-Output "scratchdir folder does not exist. No action needed."
     }
-    if (Test-Path -Path "$PSScriptRoot\oscdimg.exe") {
-        Write-Output "oscdimg.exe still exists. Attempting to remove it again..."
-        Remove-Item -Path "$PSScriptRoot\oscdimg.exe" -Force -ErrorAction SilentlyContinue
-        if (Test-Path -Path "$PSScriptRoot\oscdimg.exe") {
-            Write-Output "Failed to remove oscdimg.exe."
-        } else {
-            Write-Output "oscdimg.exe removed successfully."
-        }
-    } else {
-        Write-Output "oscdimg.exe does not exist. No action needed."
-    }
-    if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
+    if (Test-Path -Path $script:autounattendTemplatePath) {
         Write-Output "autounattend.xml still exists. Attempting to remove it again..."
-        Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
-        if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
+        Remove-Item -Path $script:autounattendTemplatePath -Force -ErrorAction SilentlyContinue
+        if (Test-Path -Path $script:autounattendTemplatePath) {
             Write-Output "Failed to remove autounattend.xml."
         } else {
             Write-Output "autounattend.xml removed successfully."
