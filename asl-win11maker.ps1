@@ -105,6 +105,21 @@
     for its own install.esd (smallest, slowest); None skips recompression entirely (largest,
     fastest export - useful mainly for quick iteration).
 
+.PARAMETER KeepCorporateApps
+    Keeps OneDrive, Outlook, Teams, and Copilot in the image instead of removing/disabling
+    them, and skips forcing the local-account-only OOBE path (Enable-LocalAccountOOBE) - even
+    if -LocalAccountName is also given, it's ignored (with a warning) so OOBE presents its
+    normal "sign in with your organization's account" flow. Intended for a build that will be
+    joined to Microsoft Entra ID / enrolled via Autopilot or Intune, where those apps and a
+    normal work-account sign-in are wanted rather than stripped out. All other debloat/
+    telemetry tweaks still apply as usual.
+
+.PARAMETER ProfileName
+    Purely cosmetic tag folded into the output ISO's filename (via Get-Tiny11IsoNameTag) and
+    into the build-info JSON's filename, so multiple runs against the same output\ folder
+    (e.g. from asl-win11-multibuild.ps1) don't collide and stay easy to tell apart. Has no
+    effect on the build itself.
+
 .EXAMPLE
     .\asl-win11maker.ps1 E D
     .\asl-win11maker.ps1 -ISO E -SCRATCH D
@@ -137,7 +152,9 @@ param (
     [switch]$EnableDotNet35,
     [string]$LocalAccountName,
     [string]$ProductKey,
-    [ValidateSet('None', 'Fast', 'Max', 'Recovery')][string]$CompressionMode = 'Fast'
+    [ValidateSet('None', 'Fast', 'Max', 'Recovery')][string]$CompressionMode = 'Fast',
+    [switch]$KeepCorporateApps,
+    [string]$ProfileName
 )
 
 if (-not $SCRATCH) {
@@ -165,6 +182,11 @@ $ErrorActionPreference = 'Stop'
 
 try {
 #---------[ Main Workflow ]---------#
+if ($KeepCorporateApps -and $LocalAccountName) {
+    Write-Output "-KeepCorporateApps set; ignoring -LocalAccountName '$LocalAccountName' so OOBE offers a work/school (Entra) sign-in instead of a local account."
+    $LocalAccountName = ''
+}
+
 # REQUIRED SETUP STEPS (do not comment out)
 Confirm-ExecutionPolicy        # REQUIRED: ensure script execution policy allows running
 Confirm-AdminPrivileges        # REQUIRED: relaunch as admin if needed (forwards all bound parameters)
@@ -297,11 +319,27 @@ $systemPackagePatterns = @(
     'Microsoft-Windows-StepsRecorder-Package~'                                 # Steps Recorder (Problem Steps Recorder - PSR)
 )
 
+# SWITCH-GATED: -KeepCorporateApps carves OneDrive/Outlook/Teams/Copilot out of the
+# provisioned-package removal list defined above, for an Entra-join-friendly build.
+if ($KeepCorporateApps) {
+    $corporateExemptPrefixes = @(
+        'Microsoft.Copilot'
+        'Microsoft.Windows.Copilot'
+        'Microsoft.Windows.Teams'
+        'MSTeams'
+        'MicrosoftTeams'
+        'Microsoft.OutlookForWindows'
+    )
+    $appPackagePrefixes = $appPackagePrefixes | Where-Object { $_ -notin $corporateExemptPrefixes }
+}
+
 # REQUIRED CUSTOMIZATION STEP (do not comment out)
 Remove-ProvisionedAppPackages -ImagePath $script:mountDir -PackagePrefixes $appPackagePrefixes   # REQUIRED: apply package removal list defined above
 
 # OPTIONAL FILE CUSTOMIZATION STEPS (safe to comment out)
-Remove-OneDriveSetup -MountDir $script:mountDir -AdminGroupName $script:adminGroupName            # OPTIONAL: remove OneDrive setup executable
+if (-not $KeepCorporateApps) {
+    Remove-OneDriveSetup -MountDir $script:mountDir -AdminGroupName $script:adminGroupName        # OPTIONAL: remove OneDrive setup executable (skipped under -KeepCorporateApps)
+}
 Remove-IsoSupportFolder -ContentRoot $script:tiny11Root                                           # OPTIONAL: drop support\ folder to shrink final ISO
 
 # CORE-BUILD-ONLY FILE CUSTOMIZATION (needs no registry hives; runs before Mount-OfflineRegistryHives)
@@ -322,16 +360,20 @@ Mount-OfflineRegistryHives                                                      
 Invoke-HardwareBypassStrategy                                                                     # REQUIRED: apply hardware bypass chosen via -BypassMode (default: None = no-op)
 # Remove-Edge -MountDir $script:mountDir -AdminGroupName $script:adminGroupName                   # OPTIONAL: remove Edge files and offline uninstall entries (always applied under -Core, below)
 Disable-SponsoredApps                                                                             # OPTIONAL: disable suggested/sponsored consumer content
-Enable-LocalAccountOOBE -MountDir $script:mountDir                                                # OPTIONAL: enable local account path during OOBE
+if (-not $KeepCorporateApps) {
+    Enable-LocalAccountOOBE -MountDir $script:mountDir                                            # OPTIONAL: enable local account path during OOBE (skipped under -KeepCorporateApps, so OOBE offers an Entra/work-account sign-in instead)
+}
 Disable-ReservedStorage                                                                           # OPTIONAL: disable reserved storage allocation
 Disable-BitLockerAutoEncryption                                                                   # OPTIONAL: prevent automatic device encryption
-Disable-ChatIcon                                                                                  # OPTIONAL: hide chat/teams taskbar icon
-Disable-OneDriveSync                                                                              # OPTIONAL: disable OneDrive sync policy
 Disable-Telemetry                                                                                 # OPTIONAL: reduce telemetry and data collection
-Disable-DevHomeOutlookInstall                                                                     # OPTIONAL: prevent automatic Dev Home/Outlook install
-Disable-Copilot                                                                                   # OPTIONAL: disable Copilot and related integrations
-Disable-TeamsInstall                                                                              # OPTIONAL: prevent Teams auto-installation
-Disable-NewOutlook                                                                                # OPTIONAL: block new Outlook app execution
+if (-not $KeepCorporateApps) {
+    Disable-ChatIcon                                                                              # OPTIONAL: hide chat/teams taskbar icon (skipped under -KeepCorporateApps - Teams is kept)
+    Disable-OneDriveSync                                                                          # OPTIONAL: disable OneDrive sync policy (skipped under -KeepCorporateApps - OneDrive is kept)
+    Disable-DevHomeOutlookInstall                                                                 # OPTIONAL: prevent automatic Dev Home/Outlook install (skipped under -KeepCorporateApps - Outlook is kept)
+    Disable-Copilot                                                                               # OPTIONAL: disable Copilot and related integrations (skipped under -KeepCorporateApps)
+    Disable-TeamsInstall                                                                          # OPTIONAL: prevent Teams auto-installation (skipped under -KeepCorporateApps)
+    Disable-NewOutlook                                                                             # OPTIONAL: block new Outlook app execution (skipped under -KeepCorporateApps)
+}
 # Disable-WindowsUpdate                                                                            # OPTIONAL: aggressive WU suppression - see docs/tweak-catalog.md (always applied under -Core, below)
 # Disable-DiagnosticServices                                                                       # OPTIONAL: disable DiagTrack/WerSvc/PcaSvc/SysMain services
 # Disable-WindowsAI                                                                                # OPTIONAL: disable Windows AI / Recall data analysis
@@ -356,7 +398,8 @@ Dismount-OfflineRegistryHives                                                   
 Complete-InstallImage      # REQUIRED: cleanup, unmount, export updated install image (exports to install.esd instead under -Core)
 Update-BootImage           # REQUIRED: mount boot.wim once for bypass tweaks and (Core) the setup CmdLine key (driver injection happens earlier, into install.wim + $WinpeDriver$ - not here)
 New-Tiny11Iso              # REQUIRED: build final ISO using oscdimg
-Write-BuildInfo -OutputPath (Join-Path $PSScriptRoot 'output\asl-win11-buildinfo.json')  # OPTIONAL: emit build metadata JSON
+$buildInfoFileName = if ($ProfileName) { "asl-win11-buildinfo_$ProfileName.json" } else { 'asl-win11-buildinfo.json' }
+Write-BuildInfo -OutputPath (Join-Path $PSScriptRoot "output\$buildInfoFileName")  # OPTIONAL: emit build metadata JSON
 Invoke-Tiny11Cleanup       # REQUIRED: remove temp files and eject mounted source media
 
 Stop-Transcript  # REQUIRED: stop transcript logging

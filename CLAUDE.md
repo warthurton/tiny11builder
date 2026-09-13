@@ -61,6 +61,13 @@ file, which the script mounts itself via `Mount-DiskImage` and dismounts again d
 resolved in `Resolve-SourceDriveLetter`, mirroring the existing `-VirtioIso` drive-letter-or-path-or-folder
 pattern.
 
+To build several image variants (hardware checks fully enforced / Entra-join-ready / fully tweaked) from one
+ISO in a single pass instead, use `asl-win11-multibuild.ps1` (see "Multi-profile builds" below) in place of
+`asl-win11maker.ps1`:
+```powershell
+.\asl-win11-multibuild.ps1 -ISO E -SCRATCH D -Edition Pro
+```
+
 Other parameters, all optional:
 - `-INDEX <n>` / `-ESDINDEX <n>` — pin the install.wim / install.esd image index non-interactively; prompts
   when omitted. Ignored if `-Edition` is also given.
@@ -142,6 +149,55 @@ Other parameters, all optional:
   scripts' hardcoded behavior. `Max` shrinks the image further at the cost of a much slower export;
   `Recovery` matches the WIMBoot-style compression Windows Setup's own install.esd uses (smallest, slowest);
   `None` skips recompression (largest, fastest — useful for quick local iteration).
+- `-KeepCorporateApps` — keeps OneDrive, Outlook, Teams, and Copilot instead of removing/disabling them
+  (carves their prefixes out of `$appPackagePrefixes` and skips `Remove-OneDriveSetup`, `Disable-ChatIcon`,
+  `Disable-OneDriveSync`, `Disable-DevHomeOutlookInstall`, `Disable-Copilot`, `Disable-TeamsInstall`, and
+  `Disable-NewOutlook`), and skips `Enable-LocalAccountOOBE` — even if `-LocalAccountName` is also given, it's
+  ignored (with a warning; the running script's own `$LocalAccountName` variable is cleared) so OOBE offers
+  its normal work/school account sign-in. Every other debloat/telemetry tweak still applies. Intended for an
+  image meant to be joined to Microsoft Entra ID / enrolled via Autopilot or Intune. Used by
+  `asl-win11-multibuild.ps1`'s `Entra` profile; rarely worth passing by hand otherwise.
+- `-ProfileName <name>` — cosmetic tag folded into the output ISO's filename (`Get-Tiny11IsoNameTag`) and the
+  build-info JSON's filename, so multiple runs sharing one `output\` folder don't overwrite each other. No
+  effect on the build itself. Set automatically by `asl-win11-multibuild.ps1`; only useful by hand if you're
+  scripting several manual runs against the same output folder yourself.
+
+### Multi-profile builds — `asl-win11-multibuild.ps1`
+
+A thin orchestrator, separate from `asl-win11maker.ps1`, for building several image variants from one source
+ISO in a single invocation instead of re-running the builder by hand with different flags. It forwards almost
+all of `asl-win11maker.ps1`'s parameters straight through and adds one of its own:
+
+- `-Profiles <Standard|Entra|Optimized>[,...]` — which profiles to build (any order; always executed in
+  `Standard`, `Entra`, `Optimized` order). Defaults to all three.
+
+The three profiles:
+- **Standard** — the regular debloated build, with `-BypassMode` forced to `None` regardless of what's
+  passed to the orchestrator, so Setup's TPM/Secure Boot/RAM hardware checks stay fully enforced. This is
+  deliberately the one build in the set that never bypasses hardware requirements.
+- **Entra** — the same debloat/telemetry tweaks as Standard, plus `-KeepCorporateApps` (see above), for a
+  build meant to be joined to Microsoft Entra ID / enrolled via Autopilot or Intune. Honors whatever
+  `-BypassMode` was passed to the orchestrator (default `None`); ignores `-LocalAccountName`.
+- **Optimized** — today's "everything on" build: whatever `-BypassMode`/`-LocalAccountName`/`-ProductKey` you
+  pass are used as-is, no `-KeepCorporateApps`. Equivalent to calling `asl-win11maker.ps1` directly with those
+  same flags.
+
+Each profile runs as its own **separate `powershell.exe` child process** (not a dot-sourced call in-loop) —
+`asl-win11maker.ps1` unconditionally `exit`s at the end of its top-level `try` block (and also `exit`s early
+if it has to self-relaunch elevated), either of which would kill an in-process orchestrator loop too. The
+orchestrator elevates itself once up front (`Confirm-AdminPrivileges`, reused from the function library) so
+every child inherits an already-elevated token and its own elevation check is a no-op, instead of each child
+racing off to relaunch itself in a detached window. Every child is also always run with `-UseSourceCache`
+under the hood (not exposed as its own switch) so only the first profile that needs it touches the mounted
+ISO or converts `install.esd`; the rest restore from the cache — this is what makes building three profiles
+take roughly one ISO-extraction's worth of time instead of three. `-RefreshSourceCache`, if passed, is
+applied only to the first profile actually built.
+
+Each profile's own final "press Enter to continue" prompt (`Invoke-Tiny11Cleanup`) still applies — the
+orchestrator doesn't suppress it, so you'll press Enter once per profile as each one finishes.
+
+Cumulative-update slipstreaming (`DISM /Add-Package` against a downloaded `.msu`) was considered alongside
+this feature but deliberately deferred — not implemented anywhere in this repo yet.
 
 There is no automated test suite — the scripts mutate a real Windows image and require admin rights plus a
 multi-GB ISO, so correctness is validated by syntax check + lint + manual runs, not unit tests.

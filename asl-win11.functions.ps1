@@ -1840,6 +1840,11 @@ function Confirm-AdminPrivileges {
                 if ($paramValue.IsPresent) {
                     $argumentList += "-$paramName"
                 }
+            } elseif ($paramValue -is [array]) {
+                # e.g. -Profiles Standard,Entra: forward as separate values, not one
+                # comma/space-joined string that would fail the parameter's ValidateSet.
+                $argumentList += "-$paramName"
+                $argumentList += @($paramValue | ForEach-Object { [string]$_ })
             } else {
                 $argumentList += @("-$paramName", [string]$paramValue)
             }
@@ -2530,6 +2535,9 @@ function Get-Tiny11IsoNameTag {
     #>
     $tags = [System.Collections.Generic.List[string]]::new()
 
+    if ($ProfileName) {
+        $tags.Add(($ProfileName -replace '[^A-Za-z0-9]', ''))
+    }
     if ($script:editionId) {
         $tags.Add(($script:editionId -replace '[^A-Za-z0-9]', ''))
     }
@@ -2539,6 +2547,7 @@ function Get-Tiny11IsoNameTag {
     if ($InjectSystemDrivers) { $tags.Add('SysDrivers') }
     if ($DriverPath) { $tags.Add('CustomDrivers') }
     if ($LocalAccountName) { $tags.Add('LocalAcct') }
+    if ($KeepCorporateApps) { $tags.Add('Corp') }
     if ($CompressionMode -and $CompressionMode -ne 'Fast') { $tags.Add("Compress$CompressionMode") }
 
     return ($tags -join '_')
