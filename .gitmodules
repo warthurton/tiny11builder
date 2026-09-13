@@ -10,3 +10,9 @@
 [submodule "rufus"]
 	path = reference/rufus
 	url = https://github.com/pbatard/rufus.git
+[submodule "UnattendedWinstall"]
+	path = reference/UnattendedWinstall
+	url = https://github.com/memstechtips/UnattendedWinstall.git
+[submodule "unattend-generator"]
+	path = reference/unattend-generator
+	url = https://github.com/cschneegans/unattend-generator.git

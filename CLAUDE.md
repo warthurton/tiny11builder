@@ -24,13 +24,22 @@ Windows 11 ISO already mounted to a drive letter.
 
 ## Submodules are reference-only
 
-`reference/winutil/`, `reference/tiny11-automated/`, `reference/tiny11builder-ntdevlabs/`, and
-`reference/rufus/` are git submodules of other projects, kept under `reference/` purely for
-comparison/lookup (see `docs/script-comparison.md`, which diffs this repo's ISO-building logic against
-winutil's `Invoke-WinUtilISOScript.ps1`). **Do not edit code inside these submodules and don't treat them as
-part of this project's build/test surface.** They exist to look up how another project solved something, not
-to be modified or kept in sync. If you add another external project for reference, add it as a submodule
-under `reference/` too.
+`reference/winutil/`, `reference/tiny11-automated/`, `reference/tiny11builder-ntdevlabs/`,
+`reference/rufus/`, `reference/UnattendedWinstall/`, and `reference/unattend-generator/` are git submodules of
+other projects, kept under `reference/` purely for comparison/lookup (see `docs/script-comparison.md`, which
+diffs this repo's ISO-building logic against winutil's `Invoke-WinUtilISOScript.ps1`). **Do not edit code
+inside these submodules and don't treat them as part of this project's build/test surface.** They exist to
+look up how another project solved something, not to be modified or kept in sync. If you add another external
+project for reference, add it as a submodule under `reference/` too.
+
+`reference/UnattendedWinstall/` ([memstechtips/UnattendedWinstall](https://github.com/memstechtips/UnattendedWinstall))
+and `reference/unattend-generator/` ([cschneegans/unattend-generator](https://github.com/cschneegans/unattend-generator),
+source for the [Windows Unattended Answer File Generator](https://schneegans.de/windows/unattend-generator/))
+are both answer-file generators/tooling, added for a possible future integration of a proper
+`autounattend.xml` generator/customizer in place of this repo's current approach (downloading ntdevlabs'
+static template and string-patching it — see `Confirm-AutounattendXml`, `ConvertTo-Tiny11AnswerFile`, and the
+other `Add-AnswerFile*`/`Initialize-PreparedAnswerFile` functions in `asl-win11.functions.ps1`). No such
+integration exists yet; these are reference-only until that work happens.
 
 ## Commands
 
