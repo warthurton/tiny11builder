@@ -181,6 +181,25 @@ Not recommended for porting: setup-script pre-staging from `<sg:File>` extension
 current asl-win11 use case needs scripts injected via the answer file, and it adds XML-parsing complexity
 for a feature nothing in this pipeline currently calls for.
 
+**New candidates identified in the 2026-10-05 submodule refresh** (not yet evaluated/implemented):
+
+9. **tiny11-automated's WinRE staging/CompactOS fix** (`8bde4bd`, "suppress WinRE staging error
+   0x80070003 and enable compact OS install") — relevant to this repo's `-Core`-only
+   `Remove-WindowsRecoveryEnvironment`/`Compress-WinSxS` functions, which do similar WinRE/WinSxS surgery.
+   Worth reading before the next time either of those functions is touched, in case the same
+   `0x80070003` failure mode applies here.
+
+10. **winutil's storage-driver injection fix** (`abcbc23`, "fix: inject Setup storage into boot.wim") —
+    **a likely correctness gap in this repo's own driver injection**, not just an FYI. winutil dropped its
+    filename-based storage-driver fallback heuristic (`iaahci|iastor|vmd|irst|rst`) after finding it let
+    non-storage "RST companion" INFs reach Setup, and now *also* injects SCSIAdapter/HDC driver packages
+    directly into boot.wim index 2 via DISM, rather than relying on `$WinpeDriver$` staging alone. This
+    repo's `Test-StorageDriverInf` still carries the same filename-fallback pattern (extended with
+    `viostor|vioscsi|nvme` for virtio), and `Add-WinPEStorageDrivers` still never touches boot.wim. See
+    `docs/build-options-reference.md`'s Drivers section for the full writeup and what re-mounting boot.wim
+    for this would cost against the current design's stated rationale (`CLAUDE.md`'s
+    `Add-WinPEStorageDrivers` note, KB2686316).
+
 ---
 
 ## Appendix: original winutil vs. tiny11maker baseline comparison

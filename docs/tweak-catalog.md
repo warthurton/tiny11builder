@@ -5,6 +5,19 @@ Full four-way inventory (this repo vs. `ntdevlabs` vs. `tiny11-automated` vs. `w
 document catalogs the *individual tweaks* so every line in `asl-win11maker.ps1` and
 `asl-win11.functions.ps1` traces back to a documented source.
 
+**Two other reference submodules** (`UnattendedWinstall`, `unattend-generator`) are answer-file *generator*
+tools rather than WIM-servicing pipelines — they don't add new appx/task/registry tweaks beyond what's
+already catalogued here (their package-removal and telemetry tweaks are the same well-known set, just
+applied at a different *time*, during Setup's specialize pass instead of offline against the mounted WIM).
+See `docs/answer-file-generators-options.md` for what they do and why that timing difference matters, and
+`docs/build-options-reference.md` for the option-first, phase/category view this catalog feeds into.
+
+*Re-verified against the reference submodules at their 2026-10-05 refresh (tiny11-automated `8bde4bd`,
+winutil `9c87c02`, ntdevlabs `00e7d8a`) — no new appx/scheduled-task/registry tweaks landed upstream since
+this catalog was last written; the only relevant upstream change in this window was winutil's storage
+driver-injection fix, which is a drivers-pipeline concern, not a catalog entry — see
+`docs/build-options-reference.md`'s Drivers section.*
+
 **Default column key:**
 - **Active** — applied unconditionally by the serviceable build
 - **Commented** — present in the customization array/pipeline but commented out; opt in by uncommenting
