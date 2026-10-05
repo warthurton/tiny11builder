@@ -1,0 +1,16 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^powershell -NoProfile -ExecutionPolicy Bypass -File \\.\\\\Invoke-RepoScriptAnalyzer\\.ps1$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^powershell -NoProfile -ExecutionPolicy Bypass -File \\.\\\\Invoke-RepoSyntaxCheck\\.ps1$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "/^\\$output = powershell -NoProfile -ExecutionPolicy Bypass -File \\.\\\\Invoke-RepoSyntaxCheck\\.ps1 \\| Out-String; Write-Output '---SYNTAX-CHECK-START---'; Write-Output \\$output; Write-Output '---SYNTAX-CHECK-END---'$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}
