@@ -29,11 +29,11 @@
         Name           = 'BypassAndDrivers'
         Description    = 'Bypass hardware checks AND inject drivers (-InjectSystemDrivers and/or ' +
                           '-InjectVirtioDrivers as needed) -- for unusual storage controllers or maximum ' +
-                          'offline portability. CAUTION: see docs/build-options-reference.md''s "Known ' +
-                          'risk, not yet remediated" note (winutil abcbc23) before relying on this for an ' +
-                          'uncommon RAID/NVMe-RAID controller -- this repo''s storage-driver INF heuristic ' +
-                          'has a known false-positive/false-negative gap that winutil already hit and fixed ' +
-                          'upstream, not yet ported here.'
+                          'offline portability. The storage-driver INF false-positive gap winutil found ' +
+                          '(abcbc23) is fixed here (Test-StorageDriverInf + Update-BootImage, see ' +
+                          'docs/build-options-reference.md''s Drivers section) -- still worth a real-' +
+                          'hardware/VM boot test for an uncommon RAID/NVMe-RAID controller before trusting ' +
+                          'a clean build log alone.'
         BypassMode     = 'Both'
         InjectDrivers  = $true
         Source         = 'build-options-reference.md#-injectsystemdrivers---driverpath-folder---injectvirtiodrivers--virtioiso-path'

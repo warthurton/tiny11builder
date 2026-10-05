@@ -21,6 +21,7 @@
     @{ Name = 'Disable-Copilot';                Tier = 1; CorporateExempt = $true;  Source = 'tweak-catalog.md#3' }
     @{ Name = 'Disable-TeamsInstall';           Tier = 1; CorporateExempt = $true;  Source = 'tweak-catalog.md#3' }
     @{ Name = 'Disable-NewOutlook';             Tier = 1; CorporateExempt = $true;  Source = 'tweak-catalog.md#3' }
+    @{ Name = 'Remove-SensitiveAnswerFilesAtFirstLogon'; Tier = 1; CorporateExempt = $false; Source = 'tweak-catalog.md#3' }
     @{ Name = 'Disable-WindowsUpdate';          Tier = 2; CorporateExempt = $false; Source = 'tweak-catalog.md#3' }
     @{ Name = 'Disable-DiagnosticServices';     Tier = 2; CorporateExempt = $false; Source = 'tweak-catalog.md#3' }
     @{ Name = 'Disable-WindowsAI';              Tier = 2; CorporateExempt = $false; Source = 'tweak-catalog.md#3' }

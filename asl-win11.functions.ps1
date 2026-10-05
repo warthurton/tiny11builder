@@ -1272,22 +1272,29 @@ function Add-VirtioDriversToImage {
 function Test-StorageDriverInf {
     <#
     .SYNOPSIS
-        Heuristically detects whether a driver .inf targets mass-storage/RAID hardware.
+        Detects whether a driver .inf targets mass-storage/RAID hardware.
     .DESCRIPTION
         Backing check for Add-WinPEStorageDrivers: WinPE only needs to see the target disk,
         not the full hardware set (GPU/audio/NIC/etc.), so only storage-class drivers are
-        worth staging into $WinpeDriver$. Matches the INF's Class directive against
-        SCSIAdapter/HDC, falling back to a filename pattern for driver families that are
-        commonly storage/RAID controllers but sometimes omit or vary that Class line.
-        Mirrors winutil's Test-WinUtilISOStorageDriver
-        (reference/winutil/functions/private/Invoke-WinUtilISOScript.ps1), extended with
-        viostor/vioscsi/nvme so virtio and NVMe controllers are also recognized.
+        worth staging into $WinpeDriver$ (and, via Add-DriversToImage, injecting into
+        boot.wim - see Update-BootImage). Matches only the INF's own Class directive against
+        SCSIAdapter/HDC.
+
+        This used to also fall back to a filename pattern (iaahci/iastor/vmd/irst/rst/
+        viostor/vioscsi/nvme) for driver families that sometimes omit or vary the Class
+        line. That fallback was removed after winutil's Test-WinUtilISOStorageDriver
+        (reference/winutil/functions/private/Invoke-WinUtilISOScript.ps1) dropped the same
+        pattern upstream (commit abcbc23, "fix: inject Setup storage into boot.wim"): a
+        same-vendor "companion" INF (e.g. an Intel RST management/UI component, not the
+        storage driver itself) can share enough of the filename pattern to match, while
+        declaring a non-storage Class - so the filename fallback both staged drivers Setup
+        never needed for WinPE and risked missing the actual narrower signal. Matching only
+        Class=SCSIAdapter|HDC is narrower but correct: every virtio (vioscsi/viostor) and
+        NVMe storage driver this repo has needed in practice declares one of those two
+        classes properly, so nothing in this repo's own driver sources is known to rely on
+        the removed fallback.
     #>
     param ([Parameter(Mandatory)][System.IO.FileInfo]$InfFile)
-
-    if ($InfFile.BaseName -match '(?i)(iaahci|iastor|vmd|irst|rst|viostor|vioscsi|nvme)') {
-        return $true
-    }
 
     try {
         return (Get-Content -LiteralPath $InfFile.FullName -Raw -ErrorAction Stop) -match '(?im)^\s*Class\s*=\s*(SCSIAdapter|HDC)\s*(?:;.*)?$'
@@ -1330,12 +1337,15 @@ function Add-WinPEStorageDrivers {
         Windows Setup auto-loads drivers from a $WinpeDriver$ folder at the root of the
         installation media during its windowsPE pass - Setup.exe scans every drive letter
         C: and above for one (Microsoft KB2686316; confirmed working from optical/ISO media,
-        not just USB) - so getting Setup to see an unusual disk controller (virtio, an
-        exotic RAID card, etc.) no longer requires mounting boot.wim and running DISM
-        Add-Driver at all. Replaces the old approach of injecting the entire driver source
-        into boot.wim via Add-DriversToImage, which bloated boot.wim with every non-storage
-        driver (GPU/audio/NIC/etc.) install.wim's own driver injection already covers for
-        the installed OS, and cost an extra mount/commit cycle.
+        not just USB). This is the primary mechanism for getting Setup to see an unusual
+        disk controller (virtio, an exotic RAID card, etc.) without injecting the *entire*
+        driver source into boot.wim via Add-DriversToImage, which would bloat boot.wim with
+        every non-storage driver (GPU/audio/NIC/etc.) install.wim's own driver injection
+        already covers for the installed OS. Update-BootImage additionally re-injects this
+        same already-storage-filtered folder into boot.wim directly via DISM as a second
+        delivery path (mirroring winutil's abcbc23 fix) - that reuses the exact set staged
+        here rather than re-scanning the driver source, so it doesn't reintroduce the bloat
+        this function exists to avoid.
 
         Only drivers Test-StorageDriverInf classifies as storage/RAID are staged; everything
         else under -SourcePath is intentionally left out. Mirrors winutil's
@@ -1553,6 +1563,45 @@ function Enable-LocalAccountOOBE {
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
     # Write the prepared autounattend.xml to Sysprep folder to automate OOBE local account setup
     Set-Content -Path "$MountDir\Windows\System32\Sysprep\autounattend.xml" -Value $script:preparedAutounattendXml -Encoding UTF8 -Force
+}
+
+function Remove-SensitiveAnswerFilesAtFirstLogon {
+    <#
+    .SYNOPSIS
+        Stages a first-logon cleanup of on-disk autounattend.xml/unattend.xml copies.
+    .DESCRIPTION
+        autounattend.xml can carry sensitive content: a real -ProductKey, and - when
+        -LocalAccountName is used - a plaintext password equal to the account name
+        (CLAUDE.md's documented trade-off for that switch). Windows Setup and this repo's
+        own pipeline both leave copies of that content sitting on the installed system where
+        any later user/process with filesystem access can read it back out:
+          - Windows\System32\Sysprep\autounattend.xml - written directly into install.wim
+            offline by Enable-LocalAccountOOBE, so Setup can find an answer file via that
+            well-known location during OOBE.
+          - Windows\Panther\unattend.xml / unattend-original.xml - Setup's own copy of
+            whatever autounattend.xml it consumed from the ISO root (New-Tiny11Iso), made
+            live during installation; this repo never writes these directly, but every build
+            produces an autounattend.xml Setup will copy here regardless of -KeepCorporateApps
+            or -LocalAccountName.
+        Ported from unattend-generator's DeleteModifier
+        (reference/unattend-generator/modifier/Delete.cs), which deletes the same Panther
+        copies (plus a Wifi.xml this repo doesn't embed) via a first-logon script for the
+        same reason - see docs/answer-file-generators-options.md.
+        A single RunOnce command line (not a staged script, matching Disable-WindowsUpdate's
+        style) runs once after the first interactive logon, once Setup no longer needs any
+        of these files; cmd.exe's `del` silently no-ops on paths that don't exist (e.g. the
+        Sysprep copy under a -KeepCorporateApps build, which skips Enable-LocalAccountOOBE),
+        so this is safe to apply unconditionally.
+    #>
+    Write-Phase 'Stage sensitive answer-file cleanup for first logon'
+    $paths = @(
+        'C:\Windows\System32\Sysprep\autounattend.xml'
+        'C:\Windows\Panther\unattend.xml'
+        'C:\Windows\Panther\unattend-original.xml'
+    )
+    $quotedPaths = ($paths | ForEach-Object { "`"$_`"" }) -join ' '
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' 'RemoveSensitiveAnswerFiles' 'REG_SZ' "cmd.exe /c del /f /q $quotedPaths"
+    Write-Output '  Sensitive answer-file cleanup staged; will run at first logon.'
 }
 
 function Disable-ReservedStorage {
@@ -2477,13 +2526,16 @@ function Update-BootImage {
     .SYNOPSIS
         Mounts boot.wim index 2 and applies every setup-time tweak in one pass.
     .DESCRIPTION
-        Replaces the old dedicated bypass-only boot.wim mount with a single mount that
-        handles the hardware-bypass registry tweaks (per -BypassMode) and, for -Core builds,
-        the Setup\CmdLine key that boots straight into setup.exe. Driver injection for
-        Windows Setup's PE environment no longer happens here - see Add-WinPEStorageDrivers,
-        called earlier in the pipeline alongside install.wim's own driver injection, which
-        stages storage-class drivers into $WinpeDriver$ at the ISO root instead of mounting
-        boot.wim a second time.
+        Handles the hardware-bypass registry tweaks (per -BypassMode), for -Core builds the
+        Setup\CmdLine key that boots straight into setup.exe, and - mirroring winutil's
+        abcbc23 fix ("fix: inject Setup storage into boot.wim") - re-injects the same
+        storage-class driver packages already staged into $WinpeDriver$ (see
+        Add-WinPEStorageDrivers, called earlier in the pipeline) directly into boot.wim's
+        own driver store via DISM. $WinpeDriver$ staging alone is Setup's documented
+        auto-load mechanism (KB2686316) and remains the primary path; this is a second,
+        belt-and-suspenders delivery of the exact same already-storage-filtered packages
+        (Test-StorageDriverInf), not a re-scan of the full driver source - so it can't bloat
+        boot.wim with GPU/audio/NIC drivers the way injecting a whole driver source used to.
     #>
     Write-Phase 'Update boot image'
     Write-Output '  Continuing with boot.wim.'
@@ -2495,6 +2547,11 @@ function Update-BootImage {
     & icacls $script:bootWimPath "/grant" "$($script:adminGroupName):(F)"
     Set-ItemProperty -Path $script:bootWimPath -Name IsReadOnly -Value $false
     Mount-WindowsImage -ImagePath $script:bootWimPath -Index 2 -Path $script:mountDir
+
+    $winpeDriverDir = Join-Path $script:tiny11Root '$WinpeDriver$'
+    if (Test-Path -LiteralPath $winpeDriverDir) {
+        Add-DriversToImage -MountPath $script:mountDir -DriverPath $winpeDriverDir -Label 'boot.wim (storage)'
+    }
 
     Write-Output '  Loading boot image registry hives...'
     reg load HKLM\zCOMPONENTS $script:mountDir\Windows\System32\config\COMPONENTS

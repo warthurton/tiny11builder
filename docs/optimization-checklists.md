@@ -26,11 +26,12 @@ to decide on every build. Print this one (see `docs/pdf/`) and tick through it w
 - [ ] Is this a disposable/dev/VM/test image that only you (or people you trust with shell access) will
       ever log into? → **Local** (`-LocalAccountName <name>`) — but first:
   - [ ] Confirmed this image will **never** be reachable by an untrusted network or user — the account
-        password equals the account name in plaintext (`CLAUDE.md`'s documented trade-off)
-  - [ ] Aware that `C:\Windows\Panther\unattend.xml` on the installed system will contain that plaintext
-        password (and your product key, if `-ProductKey` was given) with no automatic cleanup today — see
-        `docs/answer-file-generators-options.md`'s sensitive-file finding. Until a cleanup step is added,
-        manually wipe `C:\Windows\Panther\` after first boot if this matters for your use case.
+        password equals the account name in plaintext (`CLAUDE.md`'s documented trade-off). The plaintext
+        copies Setup/this pipeline would otherwise leave on disk (`Panther\unattend.xml`,
+        `Sysprep\autounattend.xml`) are now cleaned up automatically at first logon
+        (`Remove-SensitiveAnswerFilesAtFirstLogon` — see `docs/answer-file-generators-options.md`'s
+        sensitive-file finding) — this checkbox is about the password choice itself, which that cleanup
+        doesn't change.
 - [ ] Is this image meant for Microsoft/Entra account sign-in, Autopilot, or Intune enrollment? → **Online**
       (default behavior, or `-KeepCorporateApps` if you also want corporate apps kept)
 - [ ] Don't pass `-LocalAccountName` to a `-KeepCorporateApps` build — it's silently ignored with a warning
@@ -47,9 +48,10 @@ to decide on every build. Print this one (see `docs/pdf/`) and tick through it w
 - [ ] Does the target have an unusual storage controller (RAID/RST, NVMe RAID, a VM's virtio disk) that
       Setup can't see without help? → **BypassAndDrivers** (`-BypassMode Both` + `-InjectSystemDrivers`/
       `-DriverPath`/`-InjectVirtioDrivers` as appropriate) — but first:
-  - [ ] Read `docs/build-options-reference.md`'s "Known risk, not yet remediated" note on the storage-driver
-        INF heuristic (winutil `abcbc23`) before trusting this for an uncommon controller — test boot on
-        real/representative hardware, don't assume success from a clean build log alone
+  - [ ] The storage-driver INF false-positive-matching gap winutil found (`abcbc23`) is now fixed here —
+        see `docs/build-options-reference.md`'s Drivers section — but still test boot on
+        real/representative hardware for an uncommon controller, don't assume success from a clean build
+        log alone
 - [ ] Building for a fleet with mixed/unknown hardware? Consider `asl-win11-multibuild.ps1` to produce
       Standard + your bypass variant in one pass instead of guessing once
 

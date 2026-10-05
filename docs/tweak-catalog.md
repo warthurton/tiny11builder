@@ -135,6 +135,7 @@ function is forced on regardless.
 | `Disable-WindowsAI` | `WindowsAI` policy keys (HKLM + NTUSER), `DoNotShowFeedbackNotifications`, `AllowDeviceNameInTelemetry` | tiny11-automated | **Commented** |
 | `Disable-WindowsDefender` | `WinDefend`/`WdNisSvc`/`WdNisDrv`/`WdFilter`/`Sense` disabled, Settings pages hidden | asl-win11-coremaker.ps1 | Core only |
 | `Set-BootImageSetupCmdLine` | `HKLM\SYSTEM\Setup\CmdLine = X:\sources\setup.exe` | asl-win11-coremaker.ps1 | Core only |
+| `Remove-SensitiveAnswerFilesAtFirstLogon` | RunOnce entry deleting `Sysprep\autounattend.xml` and `Panther\unattend.xml`/`unattend-original.xml` at first logon — these can carry a plaintext `-LocalAccountName` password and/or `-ProductKey` | Ported from `unattend-generator`'s `DeleteModifier` (`modifier/Delete.cs`) — see `docs/answer-file-generators-options.md` | Active (unconditional; no-ops on paths that don't exist, e.g. under `-KeepCorporateApps`) |
 
 Not ported from tiny11-automated (recorded here per §4's "not recommended for porting" precedent):
 `Apply-PerformanceTweaks` (memory/network/gaming performance registry tuning) and its Tiny11-branding keys

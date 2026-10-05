@@ -363,6 +363,7 @@ Disable-SponsoredApps                                                           
 if (-not $KeepCorporateApps) {
     Enable-LocalAccountOOBE -MountDir $script:mountDir                                            # OPTIONAL: enable local account path during OOBE (skipped under -KeepCorporateApps, so OOBE offers an Entra/work-account sign-in instead)
 }
+Remove-SensitiveAnswerFilesAtFirstLogon                                                           # OPTIONAL: clean up on-disk autounattend.xml/unattend.xml copies (plaintext -LocalAccountName password, -ProductKey) left on the installed system
 Disable-ReservedStorage                                                                           # OPTIONAL: disable reserved storage allocation
 Disable-BitLockerAutoEncryption                                                                   # OPTIONAL: prevent automatic device encryption
 Disable-Telemetry                                                                                 # OPTIONAL: reduce telemetry and data collection

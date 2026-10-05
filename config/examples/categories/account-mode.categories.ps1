@@ -9,10 +9,11 @@
         Name        = 'Local'
         Description = 'OOBE creates a local administrator account automatically via -LocalAccountName; ' +
                        'no Microsoft/Entra account required. SECURITY NOTE: the password equals the ' +
-                       'account name in plaintext and is left readable in C:\Windows\Panther\unattend.xml ' +
-                       'on the installed system with no cleanup step today -- see ' +
-                       'docs/answer-file-generators-options.md''s sensitive-file finding and ' +
-                       'docs/optimization-checklists.md. Fine for disposable/dev/VM images only.'
+                       'account name in plaintext. The on-disk answer-file copies that would otherwise ' +
+                       'leak it (Panther\unattend.xml, Sysprep\autounattend.xml) are now cleaned up at ' +
+                       'first logon (Remove-SensitiveAnswerFilesAtFirstLogon) -- see ' +
+                       'docs/answer-file-generators-options.md''s sensitive-file finding -- but the ' +
+                       'password choice itself is still fine for disposable/dev/VM images only.'
         Source      = 'build-options-reference.md#-localaccountname-name'
     }
     @{

@@ -57,7 +57,7 @@ Trade-offs of the Setup-time-embedded-script approach vs. this repo's offline ap
   failures are swallowed with `-ErrorAction Continue` precisely because there's no good recovery path
   mid-Setup.
 
-## Security-relevant finding worth acting on: sensitive file cleanup
+## Security-relevant finding: sensitive file cleanup (now fixed)
 
 `reference/unattend-generator/modifier/Delete.cs` (`DeleteModifier`) deletes
 `C:\Windows\Panther\unattend.xml`, `unattend-original.xml`, and `C:\Windows\Setup\Scripts\Wifi.xml` from the
@@ -65,16 +65,19 @@ Trade-offs of the Setup-time-embedded-script approach vs. this repo's offline ap
 answer file — Wi-Fi passwords, any embedded account password, product keys and all — into `Panther\` on the
 final installed drive, readable by anyone who later gets a shell on the machine.
 
-**This repo doesn't do this.** `-LocalAccountName` (`CLAUDE.md`'s own documented caveat) sets the account's
-password to the plaintext value of the account name specifically "fine for disposable/dev/VM images... never
-use on an image reachable by an untrusted network or user" — but that plaintext password, embedded in
-`autounattend.xml`, ends up sitting in `C:\Windows\Panther\unattend.xml` on every machine this image is
-installed to, same as unattend-generator's concern, and nothing here cleans it up afterward. This is a
-concrete, low-effort hardening candidate for a future pass: a first-logon cleanup step (RunOnce or
-`Install-VirtioGuestToolsAtFirstLogon`-style scheduled task) deleting the Panther answer-file copies once
-Setup no longer needs them. Flagged here rather than fixed, since it's outside this documentation pass's
-scope — see `docs/optimization-checklists.md`'s account-mode checklist for a note to self-mitigate manually
-(e.g. wipe `C:\Windows\Panther\` post-install) until this is implemented.
+**This repo now does the equivalent.** `-LocalAccountName` (`CLAUDE.md`'s own documented caveat) sets the
+account's password to the plaintext value of the account name — "fine for disposable/dev/VM images... never
+use on an image reachable by an untrusted network or user" — and that plaintext, plus a real `-ProductKey`
+if given, used to sit unremoved in `C:\Windows\Panther\unattend.xml` and this repo's own
+`Windows\System32\Sysprep\autounattend.xml` copy (written by `Enable-LocalAccountOOBE`) on every installed
+machine. `Remove-SensitiveAnswerFilesAtFirstLogon` (`asl-win11.functions.ps1`) now stages a RunOnce entry
+that deletes all three known copies (`Sysprep\autounattend.xml`, `Panther\unattend.xml`,
+`Panther\unattend-original.xml`) at first logon, same technique as `DeleteModifier`, applied unconditionally
+(it's a no-op `del` on whichever paths don't exist for a given build, e.g. the Sysprep copy under
+`-KeepCorporateApps`). This covers the three paths this repo's own pipeline and Setup's documented behavior
+are known to populate; it hasn't been verified against every other file Setup's logging may incidentally
+leave under `Windows\Panther\` on a given Windows 11 build, so treat it as closing the known gap, not as an
+exhaustive guarantee.
 
 ## `UnattendedWinstall` specifically
 

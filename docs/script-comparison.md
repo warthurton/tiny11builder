@@ -190,15 +190,13 @@ for a feature nothing in this pipeline currently calls for.
    `0x80070003` failure mode applies here.
 
 10. **winutil's storage-driver injection fix** (`abcbc23`, "fix: inject Setup storage into boot.wim") —
-    **a likely correctness gap in this repo's own driver injection**, not just an FYI. winutil dropped its
-    filename-based storage-driver fallback heuristic (`iaahci|iastor|vmd|irst|rst`) after finding it let
-    non-storage "RST companion" INFs reach Setup, and now *also* injects SCSIAdapter/HDC driver packages
-    directly into boot.wim index 2 via DISM, rather than relying on `$WinpeDriver$` staging alone. This
-    repo's `Test-StorageDriverInf` still carries the same filename-fallback pattern (extended with
-    `viostor|vioscsi|nvme` for virtio), and `Add-WinPEStorageDrivers` still never touches boot.wim. See
-    `docs/build-options-reference.md`'s Drivers section for the full writeup and what re-mounting boot.wim
-    for this would cost against the current design's stated rationale (`CLAUDE.md`'s
-    `Add-WinPEStorageDrivers` note, KB2686316).
+    **✅ Implemented.** winutil dropped its filename-based storage-driver fallback heuristic
+    (`iaahci|iastor|vmd|irst|rst`) after finding it let non-storage "RST companion" INFs reach Setup, and
+    now *also* injects SCSIAdapter/HDC driver packages directly into boot.wim index 2 via DISM, rather than
+    relying on `$WinpeDriver$` staging alone. Both halves are now ported: `Test-StorageDriverInf` matches
+    only `Class=SCSIAdapter|HDC` (filename fallback removed), and `Update-BootImage` re-injects the staged
+    `$WinpeDriver$` folder into boot.wim via `Add-DriversToImage` right after mounting. See
+    `docs/build-options-reference.md`'s Drivers section for the full writeup.
 
 ---
 

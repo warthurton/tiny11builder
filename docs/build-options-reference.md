@@ -139,9 +139,12 @@ Autopilot / Intune-enrolled images — this is the **account mode = Online** axi
 | `Add-AnswerFileLocalAccount` | Answer-File & OOBE Behavior | Setup-time declarative (`<UserAccounts><LocalAccounts>`) | Answer-file XML | Rufus `UNATTEND_SET_USER` — `docs/rufus-feature-options.md` ("Different from Rufus" section documents this repo's plaintext-password choice vs. Rufus's blank-password + forced-change) |
 
 This is the **account mode = Local** axis. Security footnote carried over from `CLAUDE.md`: the password
-equals the account name in plaintext, and — per `docs/answer-file-generators-options.md`'s sensitive-file
-finding — that plaintext ends up readable in `C:\Windows\Panther\unattend.xml` on the installed system,
-with no cleanup step today. See `docs/optimization-checklists.md`.
+equals the account name in plaintext. Per `docs/answer-file-generators-options.md`'s sensitive-file finding,
+that plaintext (plus `-ProductKey`, if given) used to be left readable in `C:\Windows\Panther\unattend.xml`
+and `Windows\System32\Sysprep\autounattend.xml` on the installed system with no cleanup — **now fixed** via
+`Remove-SensitiveAnswerFilesAtFirstLogon`, a RunOnce entry (staged whenever `Enable-LocalAccountOOBE` runs,
+i.e. every build except `-KeepCorporateApps`) that deletes all three known copies at first logon. See
+`docs/optimization-checklists.md`.
 
 ---
 
@@ -155,17 +158,23 @@ with no cleanup step today. See `docs/optimization-checklists.md`.
 | `Resolve-VirtioDriverSource` / `Add-VirtioDriversToImage` | Drivers | Offline pre-boot | DISM `/Add-Driver`, 7-Zip extraction instead of mount | This repo, went beyond winutil's scope per `docs/script-comparison.md` §4 item 7 |
 | `Install-VirtioGuestToolsAtFirstLogon` | Drivers (guest tools) | **Post-OOBE first-logon** | Scheduled task / first-logon script | This repo |
 
-**Known risk, not yet remediated** (new finding from the 2026-10-05 submodule refresh — see
-`docs/script-comparison.md`'s new candidate #10 for the full writeup): winutil's `abcbc23` fix
-("inject Setup storage into boot.wim") found that the same filename-based storage-driver heuristic this
-repo's `Test-StorageDriverInf` still uses (`iaahci|iastor|vmd|irst|rst`, extended here with
-`viostor|vioscsi|nvme`) let non-storage "RST companion" INFs slip into `$WinpeDriver$` as false positives,
-and that `$WinpeDriver$` staging alone wasn't sufficient — winutil now *also* mounts boot.wim index 2 and
-injects the SCSIAdapter/HDC driver packages directly via DISM. This repo's `Update-BootImage` explicitly
-never mounts boot.wim for driver injection today (`CLAUDE.md`: "boot.wim itself is never mounted for this").
-Worth a dedicated look before relying on `-InjectSystemDrivers`/`-DriverPath`/`-InjectVirtioDrivers` for an
-unusual storage controller (e.g. RAID/RST, NVMe RAID) where a false-negative or false-positive INF match
-could mean Setup can't see the disk at all.
+**Remediated** (finding from the 2026-10-05 submodule refresh — see `docs/script-comparison.md`'s candidate
+#10 for the original writeup): winutil's `abcbc23` fix ("inject Setup storage into boot.wim") found that its
+filename-based storage-driver heuristic (`iaahci|iastor|vmd|irst|rst`) let non-storage "RST companion" INFs
+slip into `$WinpeDriver$` as false positives, and that `$WinpeDriver$` staging alone wasn't a sufficient
+delivery path — it now *also* mounts boot.wim index 2 and injects the SCSIAdapter/HDC driver packages
+directly via DISM. Both halves of that fix are now ported here:
+- `Test-StorageDriverInf` no longer has a filename fallback (this repo's version additionally covered
+  `viostor|vioscsi|nvme` for virtio/NVMe) — it matches only the INF's own `Class=SCSIAdapter|HDC` directive,
+  same as winutil's narrowed check.
+- `Update-BootImage` now re-injects the already-staged `$WinpeDriver$` folder into boot.wim directly via
+  `Add-DriversToImage` (DISM `/Add-Driver /Recurse`) right after mounting, reusing the exact
+  already-storage-filtered package set rather than bloating boot.wim with a full driver-source rescan.
+
+`$WinpeDriver$` staging (via KB2686316 auto-load) remains the primary mechanism; the boot.wim injection is
+a second delivery path for the same packages. Still worth a real-hardware/VM boot test after relying on
+`-InjectSystemDrivers`/`-DriverPath`/`-InjectVirtioDrivers` for an unusual storage controller — this closes
+the known false-positive-matching gap, it doesn't guarantee every possible controller's INF is well-formed.
 
 This is the other half of the **hardware compatibility** axis (alongside `-BypassMode`).
 
